@@ -26,6 +26,14 @@ The native targets are configured with
 [`kn-clang-compiler-plugin`](https://github.com/caffeine-mgn/kn-clang-compiler-plugin);
 no `cinterop` toolchain install is required from the consumer.
 
+> **Apple targets need a Mac host.** The Kotlin Multiplatform plugin
+> auto-disables `macos*`, `ios*`, `tvos*` and `watchos*` on Linux and
+> Windows, so the CI release (which runs on `ubuntu-latest` like the rest
+> of the caffeine-mgn libraries) ships the JVM + Linux + Android + Mingw
+> slice. To consume an Apple klib, build the project locally on macOS
+> (`./gradlew publishToMavenLocal`) or wait for an Apple-target CI to be
+> added.
+
 ## Built-in extensions
 
 | Extension        | Version  | Auto-loaded                                                              |

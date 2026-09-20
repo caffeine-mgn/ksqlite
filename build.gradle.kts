@@ -27,7 +27,9 @@ allprojects {
 }
 
 group = "pw.binom.db"
-version = System.getenv("GITHUB_REF_NAME") ?: "0.1.0-SNAPSHOT"
+version = (findProperty("version") as String?)
+    ?: System.getenv("GITHUB_REF_NAME")?.removePrefix("v")
+    ?: "0.1.0-SNAPSHOT"
 
 val KOTLIN_VERSION = "2.1.0"
 
@@ -358,21 +360,55 @@ mavenPublishing {
 }
 
 /*
- * Apply GPG signing to every Maven publication. The signing plugin
- * auto-applies whenever any *Publishing plugin is on the classpath, so
- * hooking its config inside `pluginManager.withPlugin("signing")` runs at
- * the right time whether or not signing was already loaded.
+ * Apply GPG signing to every Maven publication.
+ *
+ * Two modes, picked at configuration time by the `signingUseGpg`
+ * Gradle property:
+ *
+ *   signingUseGpg=true — the CI mode used by .github/workflows/release.yml
+ *   and shared with kdns / kn-clang-compiler-plugin. The GPG private key
+ *   is imported into the system keyring once at job start, and we
+ *   configure Gradle's `signing` extension to delegate to the `gpg`
+ *   binary via `useGpgCmd()`. Key name and passphrase come from
+ *   `signing.gnupg.keyName` / `signing.gnupg.passphrase` Gradle properties
+ *   (forwarded as `-P` flags from CI).
+ *
+ *   default (signingUseGpg unset) — local development mode. Read an
+ *   in-memory PGP key straight from Gradle properties without ever
+ *   touching the system keyring. Two property-naming conventions are
+ *   accepted:
+ *     - vanniktech standard: `signingInMemoryKey{,Id,Password,IsBase64}`;
+ *     - binom convention:    `binom.gpg.{private_key,key_id,password}`.
+ *   `signingInMemoryKey*` wins when both are present. The private key
+ *   value is assumed ASCII-armored with literal "\n" escapes (or
+ *   base64-encoded when `signingInMemoryKeyIsBase64=true`); either way
+ *   it is normalised into the real PGP block before being handed to
+ *   `useInMemoryPgpKeys`.
  */
 pluginManager.withPlugin("signing") {
+    if (findProperty("signingUseGpg") == "true") {
+        extensions.configure<SigningExtension>("signing") {
+            useGpgCmd()
+        }
+        logger.lifecycle("[signing] Using system gpg via signing.gnupg.keyName=${findProperty("signing.gnupg.keyName")}")
+        return@withPlugin
+    }
+
     val key = providers.gradleProperty("signingInMemoryKey").orNull
+        ?: providers.gradleProperty("binom.gpg.private_key").orNull
     val keyId = providers.gradleProperty("signingInMemoryKeyId").orNull
+        ?: providers.gradleProperty("binom.gpg.key_id").orNull
     val password = providers.gradleProperty("signingInMemoryKeyPassword").orNull
+        ?: providers.gradleProperty("binom.gpg.password").orNull
     val isBase64 = providers.gradleProperty("signingInMemoryKeyIsBase64").orNull?.toBoolean() ?: false
 
     if (key != null && keyId != null && password != null) {
         val decodedKey = if (isBase64) {
             String(Base64.getDecoder().decode(key))
         } else {
+            // Both `signingInMemoryKey` and `binom.gpg.private_key` are
+            // typically stored as ASCII-armored with literal "\n" escapes;
+            // turn them into real newlines before handing to PGP.
             key.replace("\\n", "\n")
         }
         logger.lifecycle("[signing] Using in-memory PGP key, length=${decodedKey.length}, isBase64=${isBase64}")

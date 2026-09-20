@@ -4,11 +4,19 @@ name: Release to Maven Central
 # a Sonatype Central publish. Workflow expects GITHUB_REF_NAME to be the
 # tag itself so build.gradle.kts can pick it up as the project version.
 #
-# We run on macos-latest because the Kotlin Multiplatform plugin disables
-# Apple targets (iOS, tvOS, watchOS, macOS) on non-macOS hosts. On a Mac
-# runner K/N's bundled clang can cross-compile the SQLite + sqlite-vec
-# amalgamation to every Linux / Android / Mingw target as well, so one
-# runner covers the whole matrix.
+# Conventions mirror the rest of the caffeine-mgn/* repos (kdns,
+# kn-clang-compiler-plugin): `ubuntu-latest` runner, GPG key imported into
+# the system keyring once at job start, the `signingUseGpg` flag in
+# build.gradle.kts flips the build over to `useGpgCmd()`, and the
+# Sonatype user token plus GPG key id / passphrase are forwarded as
+# `-PmavenCentral*` / `-Psigning.gnupg.*` Gradle properties.
+#
+# Apple targets (iOS / tvOS / watchOS / macOS) are declared in
+# build.gradle.kts but auto-disabled on Linux hosts by the Kotlin
+# Multiplatform plugin, so this CI publishes the JVM + Linux + Android +
+# Mingw slice. Apple klibs are built locally on a Mac when needed; that
+# also matches the kdns / kn-clang-compiler-plugin setup where the CI
+# never claims to cover Apple.
 
 on:
   push:
@@ -17,7 +25,7 @@ on:
 
 jobs:
   publish:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -34,47 +42,38 @@ jobs:
 
       # ksqlite links a SQLite + sqlite-vec amalgamation straight into
       # every native klib via clangBuildStatic, and on the JVM clangBuildDynamic
-      # produces the .dylib that NativeLoader extracts at runtime. Both
-      # call into clang from the Kotlin/Native distribution (via the
-      # kn-clang plugin), so no system clang is needed — but we still
-      # want autoconf / make available for any plugin step that shells
-      # out to configure scripts.
+      # produces the .so that NativeLoader extracts at runtime. Linux
+      # toolchain packages are needed for both: gcc/clang for the
+      # plugin and the regular Linux JDK headers for JNI.
       - name: Install build prerequisites
         run: |
-          brew update
-          brew install autoconf automake libtool pkg-config
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang mingw-w64
 
-      # The GPG key is base64-encoded so it survives transport through
-      # GitHub Actions secrets (newlines etc. are preserved verbatim).
+      # The GPG private key is stored in GitHub secrets with literal `\n`
+      # escapes (one-line encoding). `printf '%b'` interprets those
+      # escapes, the import is non-interactive (`--batch --pinentry-mode
+      # loopback`) and we let the agent know it's allowed to use the
+      # loopback pinentry.
       - name: Import GPG key
         env:
           GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSWORD }}
         run: |
-          mkdir -p ~/.gnupg
-          chmod 700 ~/.gnupg
-          printf '%b' "$GPG_KEY" | base64 -d | gpg --batch --import --passphrase "$GPG_PASSPHRASE"
+          printf '%b' "$GPG_KEY" | gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --import
           echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           gpgconf --reload gpg-agent
 
-      # The vanniktech plugin reads mavenCentralUsername / mavenCentralPassword
-      # from Gradle properties; we forward them from secrets. The same
-      # applies to the GPG triplet: signingInMemoryKey{,Id,Password,
-      # IsBase64=true}.
       - name: Publish to Maven Central
         env:
-          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
-          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}
           GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}
         run: |
           ./gradlew publishToMavenCentral \
             -Pversion=${{ github.ref_name }} \
-            -PmavenCentralUsername="$MAVEN_CENTRAL_USERNAME" \
-            -PmavenCentralPassword="$MAVEN_CENTRAL_PASSWORD" \
-            -PsigningInMemoryKey="$GPG_PRIVATE_KEY" \
-            -PsigningInMemoryKeyId="$GPG_KEY_ID" \
-            -PsigningInMemoryKeyPassword="$GPG_PASSWORD" \
-            -PsigningInMemoryKeyIsBase64=true
+            -PsigningUseGpg=true \
+            -Psigning.gnupg.keyName="$GPG_KEY_ID" \
+            -Psigning.gnupg.passphrase="$GPG_PASSWORD" \
+            -PmavenCentralUsername=${{ secrets.MAVEN_CENTRAL_USERNAME }} \
+            -PmavenCentralPassword=${{ secrets.MAVEN_CENTRAL_PASSWORD }}
