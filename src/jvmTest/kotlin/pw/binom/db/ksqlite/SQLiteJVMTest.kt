@@ -147,4 +147,66 @@ class SQLiteJVMTest {
             conn.close()
         }
     }
+
+    @Test
+    fun `JSON1 functions and Json accessor round-trip`() {
+        val conn = SQLiteConnection.memory()
+        try {
+            // JSON1 is enabled at compile time (SQLITE_ENABLE_JSON1), so
+            // every TEXT column can act as a JSON document and the
+            // json_* SQL functions are available.
+            conn.exec(
+                """
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, payload TEXT);
+                INSERT INTO docs (payload) VALUES
+                  ('{"name":"alice","tags":["a","b"]}'),
+                  ('{"name":"bob","age":30}');
+                """.trimIndent(),
+            )
+
+            conn.prepare(
+                """
+                SELECT id,
+                       json_extract(payload, '$.name') AS name,
+                       payload
+                FROM docs
+                ORDER BY id
+                """.trimIndent(),
+            ).use { stmt ->
+                stmt.executeQuery().use { rs ->
+                    assertTrue(rs.next())
+                    assertEquals("alice", rs.getText(1))
+                    val raw = rs.getJson(2)
+                    assertNotNull(raw)
+                    assertEquals(
+                        "{\"name\":\"alice\",\"tags\":[\"a\",\"b\"]}",
+                        raw!!.text,
+                    )
+
+                    assertTrue(rs.next())
+                    assertEquals("bob", rs.getText(1))
+                }
+            }
+
+            // json_array / json_object can be bound back as TEXT.
+            conn.prepare(
+                """
+                INSERT INTO docs (payload)
+                VALUES (json_object('k', json_array(1, 2, 3)))
+                """.trimIndent(),
+            ).use { it.executeUpdate() }
+
+            conn.prepare("SELECT payload FROM docs WHERE id = 3").use { stmt ->
+                stmt.executeQuery().use { rs ->
+                    assertTrue(rs.next())
+                    assertEquals(
+                        """{"k":[1,2,3]}""",
+                        rs.getJson(0)?.text,
+                    )
+                }
+            }
+        } finally {
+            conn.close()
+        }
+    }
 }

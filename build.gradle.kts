@@ -3,16 +3,19 @@ import pw.binom.kotlin.clang.clangBuildDynamic
 import pw.binom.kotlin.clang.clangBuildStatic
 import pw.binom.kotlin.clang.compileTaskName
 import pw.binom.kotlin.clang.eachNative
+import org.gradle.plugins.signing.SigningExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask
 import org.jetbrains.kotlin.konan.target.Family
 import org.jetbrains.kotlin.konan.target.HostManager
 import org.jetbrains.kotlin.konan.target.KonanTarget
+import java.util.Base64
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kn.clang)
-    `maven-publish`
+    alias(libs.plugins.dokka)
+    alias(libs.plugins.vanniktech.maven.publish)
 }
 
 allprojects {
@@ -84,6 +87,16 @@ kotlin {
     mingwX64()
     macosX64()
     macosArm64()
+    iosX64()
+    iosArm64()
+    iosSimulatorArm64()
+    tvosX64()
+    tvosArm64()
+    tvosSimulatorArm64()
+    watchosX64()
+    watchosArm32()
+    watchosArm64()
+    watchosSimulatorArm64()
     androidNativeArm32()
     androidNativeArm64()
     androidNativeX86()
@@ -260,6 +273,28 @@ kotlin {
 }
 
 publishing {
+    /*
+     * Publishing wiring.
+     *
+     * 1. Sonatype Central (Maven Central) is the target. We use the
+     *    vanniktech.maven.publish plugin which handles the Maven Central
+     *    staging + portal upload, signAllPublications(), POM defaults and
+     *    the "publish to Maven Central" task.
+     *
+     * 2. POM coordinates are pw.binom.db:ksqlite:<version> (the version is
+     *    taken from GITHUB_REF_NAME in CI, so a tagged release sets itself).
+     *
+     * 3. GPG signing uses the in-memory key/password/keyId Gradle
+     *    properties. Locally these are read from ~/.gradle/gradle.properties
+     *    (so contributors don't need to set them up); in CI they are
+     *    injected from the kdns-shaped secrets the user already
+     *    provisioned (GPG_PRIVATE_KEY / GPG_PASSWORD / GPG_KEY_ID) and
+     *    mapped onto the same property names by the workflow.
+     *
+     * 4. The key is base64-encoded when supplied through CI secrets, but
+     *    kept as a literal ASCII-armored block in ~/.gradle/gradle.properties.
+     *    `signingInMemoryKeyIsBase64` lets us switch between the two.
+     */
     publications.withType<MavenPublication> {
         pom {
             name.set("ksqlite")
@@ -284,5 +319,66 @@ publishing {
                 url.set("https://github.com/caffeine-mgn/ksqlite")
             }
         }
+    }
+}
+
+mavenPublishing {
+    publishToMavenCentral(automaticRelease = true)
+    signAllPublications()
+
+    coordinates(
+        groupId = "pw.binom.db",
+        artifactId = "ksqlite",
+        version = project.version.toString(),
+    )
+
+    pom {
+        name.set("ksqlite")
+        description.set("SQLite for Kotlin Multiplatform with built-in sqlite-vec")
+        url.set("https://github.com/caffeine-mgn/ksqlite")
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+            }
+        }
+        developers {
+            developer {
+                id.set("subochev")
+                name.set("Anton Subochev")
+                email.set("caffeine.mgn@gmail.com")
+            }
+        }
+        scm {
+            connection.set("scm:git:git://github.com/caffeine-mgn/ksqlite.git")
+            developerConnection.set("scm:git:ssh://git@github.com/caffeine-mgn/ksqlite.git")
+            url.set("https://github.com/caffeine-mgn/ksqlite")
+        }
+    }
+}
+
+/*
+ * Apply GPG signing to every Maven publication. The signing plugin
+ * auto-applies whenever any *Publishing plugin is on the classpath, so
+ * hooking its config inside `pluginManager.withPlugin("signing")` runs at
+ * the right time whether or not signing was already loaded.
+ */
+pluginManager.withPlugin("signing") {
+    val key = providers.gradleProperty("signingInMemoryKey").orNull
+    val keyId = providers.gradleProperty("signingInMemoryKeyId").orNull
+    val password = providers.gradleProperty("signingInMemoryKeyPassword").orNull
+    val isBase64 = providers.gradleProperty("signingInMemoryKeyIsBase64").orNull?.toBoolean() ?: false
+
+    if (key != null && keyId != null && password != null) {
+        val decodedKey = if (isBase64) {
+            String(Base64.getDecoder().decode(key))
+        } else {
+            key.replace("\\n", "\n")
+        }
+        logger.lifecycle("[signing] Using in-memory PGP key, length=${decodedKey.length}, isBase64=${isBase64}")
+        extensions.getByType(SigningExtension::class.java)
+            .useInMemoryPgpKeys(decodedKey, keyId, password)
+    } else {
+        logger.lifecycle("[signing] No in-memory PGP key configured; publications will be signed by the publishing plugin only.")
     }
 }

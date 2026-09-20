@@ -147,6 +147,14 @@ actual class SQLiteResultSet internal constructor(
         return out
     }
 
+    actual fun getJson(index: Int): Json? {
+        holder.requireOpen()
+        // JSON1 stores JSON values as TEXT internally. We don't try to
+        // re-serialize or round-trip the value; just hand back the raw text
+        // so the caller can pass it to whichever JSON library they prefer.
+        return getText(index)?.let(::Json)
+    }
+
     actual fun getValue(index: Int): SqlValue {
         holder.requireOpen()
         return when (columnType(index)) {

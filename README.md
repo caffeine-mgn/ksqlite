@@ -5,18 +5,22 @@ plus extensions) is linked straight into every native klib, and on the JVM a
 single JNI `.so` is built and loaded at runtime — there is no third-party JDBC
 driver, no `sqlite-jdbc` on the classpath, no Java-side shadow of the engine.
 
-The API is identical across JVM, Linux/macOS/Windows native, and Android
+The API is identical across JVM, Linux/macOS/Windows native, all of Apple's
+platforms (iOS / macOS / tvOS / watchOS, devices and simulators), and Android
 Native. You open a connection, prepare statements, and read typed columns.
 
 ## Supported targets
 
-| Target                         | Backend                                      |
-|--------------------------------|----------------------------------------------|
-| `jvm` (any host: linux/macOS/windows) | dynamic `.so` / `.dylib` / `.dll` loaded via JNI |
-| `linuxX64`, `linuxArm64`       | static C amalgamation linked into the klib   |
-| `macosX64`, `macosArm64`       | static C amalgamation linked into the klib   |
-| `mingwX64`                     | static C amalgamation linked into the klib   |
-| `androidNativeArm32`/`Arm64`/`X86`/`X64` | static C amalgamation linked into the klib |
+| Target                                       | Backend                                         |
+|----------------------------------------------|-------------------------------------------------|
+| `jvm` (any host: linux/macOS/windows)        | dynamic `.so` / `.dylib` / `.dll` loaded via JNI |
+| `linuxX64`, `linuxArm64`                     | static C amalgamation linked into the klib     |
+| `macosX64`, `macosArm64`                     | static C amalgamation linked into the klib     |
+| `iosX64`, `iosArm64`, `iosSimulatorArm64`    | static C amalgamation linked into the klib     |
+| `tvosX64`, `tvosArm64`, `tvosSimulatorArm64` | static C amalgamation linked into the klib     |
+| `watchosX64`, `watchosArm32`, `watchosArm64`, `watchosSimulatorArm64` | static C amalgamation linked into the klib |
+| `mingwX64`                                   | static C amalgamation linked into the klib     |
+| `androidNativeArm32`/`Arm64`/`X86`/`X64`     | static C amalgamation linked into the klib     |
 
 The native targets are configured with
 [`kn-clang-compiler-plugin`](https://github.com/caffeine-mgn/kn-clang-compiler-plugin);
@@ -24,19 +28,22 @@ no `cinterop` toolchain install is required from the consumer.
 
 ## Built-in extensions
 
-| Extension        | Version  | Auto-loaded                       |
-|------------------|----------|-----------------------------------|
+| Extension        | Version  | Auto-loaded                                                              |
+|------------------|----------|--------------------------------------------------------------------------|
 | **sqlite-vec**   | `0.1.9`  | yes — registered via `sqlite3_auto_extension` on JVM startup, statically linked into every native klib |
+| **JSON1**        | bundled  | compiled into the amalgamation with `-DSQLITE_ENABLE_JSON1`              |
+| **FTS3 / FTS4 / FTS5** | bundled | full-text search compiled into the amalgamation                       |
+| **RTREE**        | bundled  | R-tree spatial index compiled into the amalgamation                      |
 
 `sqlite-vec` gives you virtual `vec0` tables for vector search (k-nearest
 neighbours, cosine / L2 / Hamming distance, etc.). The engine is configured
-with `SQLITE_ENABLE_MATH_FUNCTIONS` etc. through the `sqlite3.c` amalgamation
-in `src/native/`.
+with `SQLITE_THREADSAFE=1`, `FTS3/4/5`, `RTREE`, `JSON1`, `COLUMN_METADATA`,
+`DBSTAT_VTAB`, `EXPLAIN_COMMENTS`, `UNLOCK_NOTIFY`, `UPDATE_DELETE_LIMIT`
+through the `sqlite3.c` amalgamation in `src/native/`. See the comments in
+`build.gradle.kts` (`SQLITE_COMPILE_FLAGS`) for the exact list.
 
-Other extensions (FTS5, JSON1, RTREE, etc.) are already compiled into the
-core amalgamation but no other out-of-tree extensions are bundled. Add your
-own by dropping the C file into `src/native/` and appending it to the
-`compileFile(...)` calls in `build.gradle.kts`.
+Add your own out-of-tree extension by dropping the C file into `src/native/`
+and appending it to the `compileFile(...)` calls in `build.gradle.kts`.
 
 ## Versioning
 
@@ -103,7 +110,8 @@ conn.prepare("SELECT id, name, score FROM users WHERE id = ?").use { stmt ->
 Supported column accessors: `getLong`, `getInt`, `getDouble`, `getFloat`,
 `getBoolean`, `getString`, `getBlob`, `getBytes`, `getNull`,
 plus the same set keyed by column name. `getBytes` / `getBlob` returns a
-`ByteArray`, `getString` is UTF-8.
+`ByteArray`, `getString` is UTF-8. JSON columns are read with `getJson` (see
+below).
 
 ### Parameter binding
 
@@ -116,7 +124,7 @@ conn.prepare("INSERT INTO users(name, score) VALUES (?, ?)").use { stmt ->
 ```
 
 Supported bind types: `Long`, `Int`, `Double`, `Float`, `Boolean`, `String`,
-`ByteArray`. `null` is bound as SQL `NULL`.
+`ByteArray`, `FloatArray` (vector). `null` is bound as SQL `NULL`.
 
 ### Transactions
 
@@ -193,6 +201,44 @@ stmt.bind(1, v)
 `Vector.toFloatArray()` and `Vector.asBytes()` (for `BLOB` columns) cover the
 other directions.
 
+### JSON via the JSON1 extension
+
+JSON1 is compiled into the amalgamation with `-DSQLITE_ENABLE_JSON1`, so
+every TEXT column can act as a JSON document and the SQL functions
+(`json_extract`, `json_array`, `json_object`, `json_each`, …) work straight
+away:
+
+```kotlin
+conn.exec("""
+    CREATE TABLE docs (id INTEGER PRIMARY KEY, payload TEXT);
+    INSERT INTO docs (payload) VALUES
+      ('{"name":"alice","tags":["a","b"]}'),
+      ('{"name":"bob","age":30}');
+""")
+
+conn.prepare("""
+    SELECT id,
+           json_extract(payload, '$.name') AS name,
+           payload
+    FROM docs
+    ORDER BY id
+""").use { stmt ->
+    stmt.executeQuery().use { rs ->
+        while (rs.next()) {
+            val name = rs.getText(1)         // "alice", "bob"
+            val raw  = rs.getJson(2)        // Json(text = "{...}")
+            // parse raw.text with kotlinx.serialization / your favourite lib
+        }
+    }
+}
+```
+
+`Json` is just a typed wrapper around the raw JSON text — `getJson` returns
+`null` on SQL NULL and the underlying text is preserved verbatim. There is no
+Kotlin-side parsing because most projects will reach for kotlinx.serialization
+or their own JSON layer; the API just gives you a self-describing accessor
+that won't silently coerce to a `String`.
+
 ### Convenience queries
 
 ```kotlin
@@ -212,8 +258,9 @@ val name     = conn.queryForString("SELECT name FROM users WHERE id = ?", 0, 42L
 ./gradlew linuxX64Test    # run the linuxX64 tests
 ```
 
-Other natives (`macosArm64`, `mingwX64`, …) are skipped on Linux hosts because
-the corresponding toolchain is unavailable.
+Other natives (`macosArm64`, `iosArm64`, `mingwX64`, …) are skipped on Linux
+hosts because the corresponding toolchain is unavailable; the JVM and Linux
+tests run everywhere.
 
 ## Loading the native library on the JVM
 

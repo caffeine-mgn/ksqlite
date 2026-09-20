@@ -45,6 +45,16 @@ expect class SQLiteResultSet : AutoCloseable {
      */
     fun getVector(index: Int): FloatArray?
 
+    /**
+     * Read a JSON column as [Json]. The value is stored as TEXT in SQLite
+     * (this is what the JSON1 extension assumes); we keep the raw text and
+     * do no parsing — turn it into a typed value yourself with
+     * kotlinx.serialization or whatever you want.
+     *
+     * Returns null on SQL NULL.
+     */
+    fun getJson(index: Int): Json?
+
     /** Read the value at [index] as a tagged union. */
     fun getValue(index: Int): SqlValue
 

@@ -86,6 +86,11 @@ actual class SQLiteResultSet internal constructor(
         return out
     }
 
+    actual fun getJson(index: Int): Json? {
+        holder.requireOpen()
+        return SQLiteNative.getText(holder.stmt, index)?.let(::Json)
+    }
+
     actual fun getValue(index: Int): SqlValue {
         holder.requireOpen()
         return when (columnType(index)) {
