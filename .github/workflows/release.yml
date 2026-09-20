@@ -75,5 +75,5 @@ jobs:
             -PsigningUseGpg=true \
             -Psigning.gnupg.keyName="$GPG_KEY_ID" \
             -Psigning.gnupg.passphrase="$GPG_PASSWORD" \
-            -PmavenCentralUsername=${{ secrets.MAVEN_CENTRAL_USERNAME }} \
-            -PmavenCentralPassword=${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+            -PmavenCentralUsername=${{ secrets.CENTRAL_USENAME }} \
+            -PmavenCentralPassword=${{ secrets.CENTRAL_PASSWORD }}
