@@ -1,0 +1,9 @@
+[versions]
+kotlin = "2.1.0"
+kn-clang = "0.0.5"
+
+[libraries]
+
+[plugins]
+kn-clang = { id = "pw.binom.kn-clang", version.ref = "kn-clang" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }

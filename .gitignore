@@ -1,0 +1,11 @@
+.gradle/
+build/
+.kotlin/
+out/
+*.iml
+.idea/
+.kotlinc-idea
+.kotlin_compile_errors.log
+local.properties
+.DS_Store
+hs_err_pid*.log

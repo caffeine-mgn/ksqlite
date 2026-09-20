@@ -1,0 +1,5 @@
+headers = sqlite3.h sqlite-vec/sqlite-vec.h ksqlite_shim.h
+headerFilter = *
+compilerOpts = -DSQLITE_CORE=1
+---
+int ksqlite_init();
