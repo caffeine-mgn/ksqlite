@@ -80,21 +80,16 @@ actual class SQLitePreparedStatement internal constructor(
 
     actual fun bindText(index: Int, value: String) {
         checkOpen()
-        // UTF-8 bytes of the Kotlin String. ksqlite_bind_text uses
-        // SQLITE_TRANSIENT so we can let `bytes` go out of scope after the
-        // call returns — SQLite has already copied.
-        value.encodeToByteArray().usePinned { pinned ->
-            bindCheck(
-                ksqlite_bind_text(
-                    stmt,
-                    index,
-                    pinned.addressOf(0).reinterpret(),
-                    value.utf8ByteCount(),
-                ),
-                "bindText",
-                index,
-            )
-        }
+        // ksqlite_bind_text is declared in ksqlite_shim.h with a
+        // `const char *` first text argument and a separate length; the
+        // cinterop generated binding carries a String? overload that
+        // hands the bytes off to SQLITE_TRANSIENT internally, so we
+        // don't have to pin the byte array ourselves.
+        bindCheck(
+            ksqlite_bind_text(stmt, index, value, value.utf8ByteCount()),
+            "bindText",
+            index,
+        )
     }
 
     actual fun bindBlob(index: Int, value: ByteArray) {
