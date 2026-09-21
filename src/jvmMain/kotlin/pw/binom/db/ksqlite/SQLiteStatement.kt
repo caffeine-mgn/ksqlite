@@ -1,9 +1,15 @@
 package pw.binom.db.ksqlite
 
 /**
- * Shared lifecycle for any compiled sqlite3_stmt handle. Both the
+ * Shared lifecycle guard for any compiled sqlite3_stmt handle. Both the
  * one-shot [SQLiteStatement] and the reusable [SQLitePreparedStatement]
- * own one of these and delegate finalize() to it.
+ * own one of these for `requireOpen` checks; the actual handle finalization
+ * is performed by the owning statement via [SQLiteNative.finalize] inside
+ * its own `close()`.
+ *
+ * См. [StmtHolder] KDoc — почему здесь НЕТ finalize()-метода (это устраняет
+ * SIGSEGV в `pthread_mutex_lock` при GC StmtHolder после закрытия parent
+ * connection).
  */
 internal class StmtHolder internal constructor(
     internal val stmt: Long,
@@ -11,10 +17,7 @@ internal class StmtHolder internal constructor(
 ) {
     private var finalized = false
 
-    fun finalize() {
-        if (!finalized && stmt != 0L) {
-            SQLiteNative.finalize(stmt)
-        }
+    fun markFinalized() {
         finalized = true
     }
 
@@ -41,7 +44,7 @@ actual class SQLiteStatement internal constructor(
                 else -> throw mapError(conn, h.stmt, rc, "executeUpdate")
             }
         } finally {
-            h.finalize()
+            finalizeHolder(h)
         }
     }
 
@@ -52,12 +55,21 @@ actual class SQLiteStatement internal constructor(
     }
 
     actual override fun close() {
-        holder?.finalize()
+        finalizeHolder(holder)
         holder = null
     }
 
+    private fun finalizeHolder(h: StmtHolder?) {
+        if (h == null) return
+        val handle = h.stmt
+        if (handle != 0L) {
+            SQLiteNative.finalize(handle)
+        }
+        h.markFinalized()
+    }
+
     private fun compile(sql: String): StmtHolder {
-        holder?.finalize()
+        finalizeHolder(holder)
         val stmtOut = LongArray(1)
         val rc = SQLiteNative.prepare(conn.handle, sql, stmtOut)
         if (rc != SQLiteNative.sqliteOk() || stmtOut[0] == 0L) {
@@ -82,5 +94,5 @@ internal fun SQLiteConnection.errorMessage(): String {
     val buf = ByteArray(512)
     val n = SQLiteNative.errmsg(handle, buf, buf.size)
     if (n <= 0) return "unknown"
-    return buf.copyOf(n).toString(Charsets.UTF_8)
+    return buf.copyOf(buf.size).toString(Charsets.UTF_8)
 }

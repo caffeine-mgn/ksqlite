@@ -109,6 +109,9 @@ actual class SQLiteResultSet internal constructor(
             // reset the cursor. For ad-hoc statement results, the owner is
             // the SQLiteStatement which finalizes the stmt in its close().
             SQLiteNative.reset(holder.stmt)
+            // Помечаем holder finalized — чтобы GC не пытался ничего
+            // сделать с stmt handle (см. KDoc в StmtHolder).
+            holder.markFinalized()
         }
     }
 }
