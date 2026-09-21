@@ -15,7 +15,7 @@ The API is identical across JVM, Linux/macOS/Windows native, all of Apple's
 platforms (iOS / macOS / tvOS / watchOS, devices and simulators), and Android
 Native. You open a connection, prepare statements, and read typed columns.
 
-Current version: **0.1.0**.
+Current version: **0.1.1**.
 
 ## Supported targets
 
