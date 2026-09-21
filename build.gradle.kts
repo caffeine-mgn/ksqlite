@@ -31,7 +31,7 @@ version = (findProperty("version") as String?)
     ?: System.getenv("GITHUB_REF_NAME")?.removePrefix("v")
     ?: "0.1.0-SNAPSHOT"
 
-val KOTLIN_VERSION = "2.1.0"
+val KOTLIN_VERSION = "2.4.20"
 
 val NATIVE_SQLITE_SRC = file("${layout.projectDirectory}/src/native/sqlite3.c")
 val NATIVE_VEC_SRC = file("${layout.projectDirectory}/src/native/sqlite-vec/sqlite-vec.c")

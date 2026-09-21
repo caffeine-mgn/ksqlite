@@ -2,7 +2,7 @@
 
 [![Maven Central](https://img.shields.io/maven-central/v/pw.binom.db/ksqlite?label=Maven%20Central)](https://central.sonatype.com/artifact/pw.binom.db/ksqlite)
 [![License: Apache-2.0](https://img.shields.io/github/license/caffeine-mgn/ksqlite)](https://www.apache.org/licenses/LICENSE-2.0.txt)
-[![Kotlin](https://img.shields.io/badge/kotlin-2.1.0-blue.svg)](https://kotlinlang.org)
+[![Kotlin](https://img.shields.io/badge/kotlin-2.4.20-blue.svg)](https://kotlinlang.org)
 [![SQLite](https://img.shields.io/badge/SQLite-3.53.4-blue.svg)](https://sqlite.org)
 [![sqlite-vec](https://img.shields.io/badge/sqlite--vec-0.1.9-blueviolet.svg)](https://github.com/asg017/sqlite-vec)
 
@@ -15,7 +15,7 @@ The API is identical across JVM, Linux/macOS/Windows native, all of Apple's
 platforms (iOS / macOS / tvOS / watchOS, devices and simulators), and Android
 Native. You open a connection, prepare statements, and read typed columns.
 
-Current version: **0.1.1**.
+Current version: **0.1.0**.
 
 ## Supported targets
 
