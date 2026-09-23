@@ -13,15 +13,18 @@ driver, no `sqlite-jdbc` on the classpath, no Java-side shadow of the engine.
 
 The API is identical across JVM, Linux/macOS/Windows native, all of Apple's
 platforms (iOS / macOS / tvOS / watchOS, devices and simulators), and Android
-Native. You open a connection, prepare statements, and read typed columns.
+(either the regular JVM bytecode variant or `androidNative*` Kotlin/Native
+targets — both are built from the same C amalgamation). You open a connection,
+prepare statements, and read typed columns.
 
-Current version: **0.1.2**.
+Current version: **0.1.3**.
 
 ## Supported targets
 
 | Target                                       | Backend                                         |
 |----------------------------------------------|-------------------------------------------------|
 | `jvm` (any host: linux/macOS/windows)        | dynamic `.so` / `.dylib` / `.dll` loaded via JNI |
+| `jvm` on Android (Dalvik/ART, all 4 ABIs)    | dynamic `.so` bundled in the JAR, loaded via JNI  |
 | `linuxX64`, `linuxArm64`                     | static C amalgamation linked into the klib     |
 | `macosX64`, `macosArm64`                     | static C amalgamation linked into the klib     |
 | `iosX64`, `iosArm64`, `iosSimulatorArm64`    | static C amalgamation linked into the klib     |
@@ -64,18 +67,17 @@ and appending it to the `compileFile(...)` calls in `build.gradle.kts`.
 ## Versioning
 
 The published version is taken from the `GITHUB_REF_NAME` environment variable
-in CI and falls back to `0.1.0-SNAPSHOT` locally.
+in CI (the tag itself, e.g. `0.1.3`) and falls back to `0.1.3` locally.
 
 ## Installation
 
-Add the dependency to your KMP module (replace `VERSION` with the tag you
-want):
+Add the dependency to your KMP module (Gradle Kotlin DSL, 0.1.3):
 
 ```kotlin
 kotlin {
     sourceSets {
         commonMain.dependencies {
-            implementation("pw.binom.db:ksqlite:VERSION")
+            implementation("pw.binom.db:ksqlite:0.1.3")
         }
     }
 }
@@ -84,7 +86,12 @@ kotlin {
 The native targets pull the right static klib automatically. On the JVM
 nothing extra is required — the native library is built by Gradle at compile
 time and extracted on first use into the user's cache directory (see
-`NativeLoader`).
+`NativeLoader`). The Android JVM JAR carries four `.so` files
+(`android_arm32/libksqlite.so`, `android_arm64/libksqlite.so`,
+`android_x86/libksqlite.so`, `android_x64/libksqlite.so`); `NativeLoader`
+detects Dalvik/ART at runtime via `java.vendor` / `java.vm.name` and picks
+the matching one. If the host ABI's `.so` is missing from the JAR the loader
+throws an explicit `IllegalStateException` listing the supported ones.
 
 ## Examples
 
