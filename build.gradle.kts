@@ -27,9 +27,17 @@ allprojects {
 }
 
 group = "pw.binom.db"
-version = (findProperty("version") as String?)
-    ?: System.getenv("GITHUB_REF_NAME")?.removePrefix("v")
-    ?: "0.1.0-SNAPSHOT"
+val PROP_VERSION = findProperty("version") as String?
+val ENV_VERSION = System.getenv("GITHUB_REF_NAME")?.removePrefix("v")
+// Gradle's default project.version is the literal string "unspecified" (not
+// null), so a plain `?: "0.1.3"` chain never reaches the fallback when the
+// `version=` Gradle property is missing — `findProperty("version")` returns
+// "unspecified" instead of null. We have to explicitly guard against it.
+version = when {
+    !PROP_VERSION.isNullOrBlank() && PROP_VERSION != "unspecified" -> PROP_VERSION
+    !ENV_VERSION.isNullOrBlank() && ENV_VERSION != "unspecified" -> ENV_VERSION
+    else -> "0.1.3"
+}
 
 val KOTLIN_VERSION = "2.4.20"
 
@@ -41,6 +49,38 @@ val NATIVE_INCLUDE_DIRS = listOf(
     file("${layout.projectDirectory}/src/nativeMain/c"),
 )
 val JVM_JNI_SRC_DIR = file("${layout.projectDirectory}/src/jvmMain/c")
+
+/*
+ * Path to the Android NDK sysroot bundled into KONAN_DATA_DIR/dependencies.
+ * kn-clang's Konan dependency downloader unpacks `target-sysroot-1-android_ndk`
+ * and `target-toolchain-2-{linux,osx,windows}-android_ndk` here the first
+ * time an Android KonanTarget is requested; once present, kn-clang can
+ * cross-compile for any of {android_arm32, android_arm64, android_x86,
+ * android_x64} from a Linux/macOS/Windows host. We probe this directory
+ * before scheduling the JNI cross-build so a host without the NDK can
+ * silently skip the Android tasks instead of failing mid-link.
+ */
+fun konanNdkDir(target: KonanTarget): File {
+    val konanDataDir = System.getenv("KONAN_DATA_DIR")?.let { File(it) }
+        ?: File(System.getProperty("user.home"), ".konan")
+    val triple = when (target) {
+        KonanTarget.ANDROID_ARM32 -> "arm-linux-androideabi"
+        KonanTarget.ANDROID_ARM64 -> "aarch64-linux-android"
+        KonanTarget.ANDROID_X86 -> "i686-linux-android"
+        KonanTarget.ANDROID_X64 -> "x86_64-linux-android"
+        else -> error("konanNdkDir called with non-Android target: $target")
+    }
+    // Kn-clang's Konan.downloader unpacks the Android NDK under
+    //   $KONAN_DATA_DIR/dependencies/target-toolchain-2-{linux,osx,windows}-android_ndk
+    // (we use the linux one — the Linux-host clang + Linux NDK sysroot works
+    // fine for any host that can run Gradle). The per-target triple lives as
+    //   $triple/...   (e.g. aarch64-linux-android/)
+    // and the clang drivers live as
+    //   bin/$triple{21,29}-clang
+    // We accept any of those as the "NDK is available" marker.
+    val toolchainRoot = konanDataDir.resolve("dependencies/target-toolchain-2-linux-android_ndk")
+    return toolchainRoot.resolve(triple)
+}
 
 /*
  * Compile-time flags baked into the SQLite amalgamation + sqlite-vec.
@@ -158,6 +198,14 @@ kotlin {
      * mingw_x64} eagerly; on macOS we only build for the local host (Apple's
      * clang cannot cross-compile to Linux/Windows from Darwin without SDK
      * hacking, mirroring the klua convention).
+     *
+     * Android JNI libs (android_arm32, android_arm64, android_x86, android_x64)
+     * are built for any host that has the NDK sysroot already cached under
+     * ~/.konan/dependencies/target-sysroot-1-android_ndk — that's where
+     * kn-clang's Konan downloader places it on first use. The .so is bundled
+     * into the jar under /android_<arch>/libksqlite.so and unpacked by
+     * NativeLoader on first access on the device (Dalvik/ART VM is detected
+     * via `java.vendor == "The Android Project"` and `os.arch`).
      */
     val currentHost = HostManager.host
     val isMacHost = currentHost == KonanTarget.MACOS_X64 ||
@@ -166,6 +214,14 @@ kotlin {
         add(KonanTarget.LINUX_X64)
         add(KonanTarget.LINUX_ARM64)
         add(KonanTarget.MINGW_X64)
+        // Android JNI: buildable from any Linux/macOS/Windows host that has
+        // the Android NDK sysroot already cached in KONAN_DATA_DIR/dependencies.
+        // We register all four Android targets unconditionally and let
+        // `checkSysrootInstalled` no-op the ones whose sysroot isn't present.
+        add(KonanTarget.ANDROID_ARM32)
+        add(KonanTarget.ANDROID_ARM64)
+        add(KonanTarget.ANDROID_X86)
+        add(KonanTarget.ANDROID_X64)
         if (isMacHost) add(currentHost)
     }
 
@@ -178,6 +234,7 @@ kotlin {
     val jdkInclude = jdkIncludeCandidates.firstOrNull { File(it).exists() } ?: ""
 
     val jvmBuildTasks = jvmHostTargets.associateWith { target ->
+        val isAndroidTarget = target.family == Family.ANDROID
         val platform = when (target.family) {
             Family.LINUX, Family.ANDROID -> "linux"
             Family.OSX -> "darwin"
@@ -197,8 +254,10 @@ kotlin {
             compileArgs(*SQLITE_COMPILE_FLAGS.toTypedArray())
             NATIVE_INCLUDE_DIRS.forEach { include(it) }
             include(JVM_JNI_SRC_DIR)
-            if (jdkInclude.isNotEmpty()) include(File(jdkInclude))
-            if (jdkIncludePlatform.isNotEmpty()) include(File(jdkIncludePlatform))
+            if (!isAndroidTarget) {
+                if (jdkInclude.isNotEmpty()) include(File(jdkInclude))
+                if (jdkIncludePlatform.isNotEmpty()) include(File(jdkIncludePlatform))
+            }
             compileFile(NATIVE_SQLITE_SRC)
             compileFile(NATIVE_VEC_SRC)
             compileFile(file("${layout.projectDirectory}/src/nativeMain/c/ksqlite_shim.c"))
@@ -212,8 +271,17 @@ kotlin {
             val needsCrossCompile = target != currentHost
             if (needsCrossCompile) {
                 val jdkIncludeOk = jdkInclude.isNotEmpty() && jdkIncludePlatform.isNotEmpty()
-                dynamicTask.onlyIf("${target.name} JDK headers") {
-                    jdkIncludeOk
+                dynamicTask.onlyIf("${target.name} toolchain available") {
+                    if (isAndroidTarget) {
+                        // kn-clang's Konan.downloader already pulled the NDK sysroot
+                        // into KONAN_DATA_DIR/dependencies; if it's missing the
+                        // dependency download task would itself fail loudly. Here
+                        // we just skip silently so a host without NDK doesn't error
+                        // out — the jar simply won't carry the matching .so.
+                        konanNdkDir(target).exists()
+                    } else {
+                        jdkIncludeOk
+                    }
                 }
             }
         }

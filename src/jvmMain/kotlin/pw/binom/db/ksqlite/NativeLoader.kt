@@ -19,11 +19,17 @@ import kotlin.concurrent.withLock
  * and System.load()'s it.
  *
  * Layout inside the JAR (built by the Gradle `copyKsqliteNativeLib*` tasks):
- *   /<target>/libksqlite.so   (linux)
+ *   /<target>/libksqlite.so   (linux, android)
  *   /<target>/libksqlite.dylib (macOS)
  *   /<target>/libksqlite.dll  (Windows)
  *
- * Where `<target>` is the Konan target name (linux_x64, mingw_x64, ...).
+ * Where `<target>` is the Konan target name (linux_x64, android_arm64, ...).
+ *
+ * Note on Android: the Dalvik/ART VM reports `os.name == "Linux"` and
+ * `os.arch == "aarch64"` (or `armv8l` on some images), but an Android .so is
+ * NOT a Linux .so — different libc (bionic), different dynamic linker, no
+ * glibc/musl. We detect Android explicitly via `java.vendor` (the Android
+ * runtime reports `"The Android Project"`) and look under `android_*` paths.
  *
  * Why not `System.loadLibrary("ksqlite")`?
  *  - That requires every consumer to set `-Djava.library.path`. We don't want
@@ -84,15 +90,29 @@ internal object NativeLoader {
     private fun readInJarSha256(target: String, libFileName: String): ByteArray {
         val zipPath = "/$target/$libFileName"
         val stream = NativeLoader::class.java.getResourceAsStream(zipPath)
-            ?: error("ksqlite native library not found in jar at $zipPath")
+            ?: error(jarMissingMessage(target, libFileName, zipPath))
         return stream.use { sha256OfStream(it) }
     }
 
     private fun writeFromJar(target: String, libFileName: String, targetFile: Path) {
         val zipPath = "/$target/$libFileName"
         val stream = NativeLoader::class.java.getResourceAsStream(zipPath)
-            ?: error("ksqlite native library not found in jar at $zipPath")
+            ?: error(jarMissingMessage(target, libFileName, zipPath))
         stream.use { input -> Files.newOutputStream(targetFile).use { input.copyTo(it) } }
+    }
+
+    private fun jarMissingMessage(target: String, libFileName: String, zipPath: String): String {
+        val onAndroid = isAndroid()
+        val hint = if (onAndroid) {
+            "ksqlite was built without Android support; on Android you should depend on the " +
+                    "Kotlin/Native variant `pw.binom.db:ksqlite-androidNativeArm64` (or arm32/x86/x64) " +
+                    "instead of the JVM artifact."
+        } else {
+            "this looks like an unsupported platform; ksqlite ships native libraries only for " +
+                    "linux_x64, linux_arm64, mingw_x64, macos_x64, macos_arm64, android_arm32, " +
+                    "android_arm64, android_x86, android_x64."
+        }
+        return "ksqlite native library not found in jar at $zipPath. $hint"
     }
 
     private fun sha256OfFile(path: Path): ByteArray = Files.newInputStream(path).use { sha256OfStream(it) }
@@ -156,6 +176,7 @@ internal object NativeLoader {
     private fun currentResource(): String {
         val os = System.getProperty("os.name").lowercase()
         val arch = System.getProperty("os.arch").lowercase()
+        if (isAndroid()) return currentAndroidResource(arch)
         return when {
             os.contains("linux") && (arch.contains("amd64") || arch == "x86_64") -> "linux_x64"
             os.contains("linux") && (arch.contains("aarch64") || arch.contains("arm64")) -> "linux_arm64"
@@ -164,6 +185,30 @@ internal object NativeLoader {
             os.contains("windows") && (arch.contains("amd64") || arch == "x86_64") -> "mingw_x64"
             else -> error("Unsupported OS/arch: $os / $arch")
         }
+    }
+
+    private fun currentAndroidResource(arch: String): String = when {
+        arch.contains("aarch64") || arch.contains("arm64") || arch.contains("armv8") -> "android_arm64"
+        arch.contains("amd64") || arch == "x86_64" || arch.contains("x86_64") -> "android_x64"
+        arch.contains("i686") || arch.contains("x86") -> "android_x86"
+        // arm32 comes in two flavours from the JVM: "arm" (post-Android-8 most common)
+        // or "armv7l". Both map to the same androidNativeArm32 build.
+        arch == "arm" || arch.contains("armv7") || arch.contains("armv6") -> "android_arm32"
+        else -> error("Unsupported Android arch: $arch")
+    }
+
+    private fun isAndroid(): Boolean {
+        // The Android runtime reports `java.vendor == "The Android Project"`. We
+        // also check `java.vendor.url` because some custom ROMs set the former
+        // to "OpenJDK" while still leaving an android-specific marker. The
+        // combination is robust enough for a classpath-only loader.
+        val vendor = System.getProperty("java.vendor")?.lowercase() ?: ""
+        val vendorUrl = System.getProperty("java.vendor.url")?.lowercase() ?: ""
+        val vmName = System.getProperty("java.vm.name")?.lowercase() ?: ""
+        return vendor.contains("android") ||
+                vendorUrl.contains("android") ||
+                vmName.contains("dalvik") ||
+                vmName.contains("art")
     }
 
     private fun currentLibFileName(): String {
