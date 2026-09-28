@@ -188,10 +188,17 @@ private fun CPointer<ByteVar>.readBytes(size: Int): ByteArray {
     // can't legally bridge those word sizes, so a byte-by-byte loop is the
     // simplest portable solution. SQLite blob columns are typically small
     // (kilobytes), so the constant factor doesn't matter.
-    var p: CPointer<ByteVar> = this
-    repeat(size) { i ->
-        out[i] = p[i]
-        p = p.plus(1)!!
+    //
+    // NOTE: indexing into `this` is a C pointer offset (`(this + i).pointed.value`),
+    // NOT an iteration over `out`, so the offset is always relative to the
+    // start of the buffer. An earlier version of this loop also advanced a
+    // local `p` cursor by one per iteration, which combined with `p[i]`
+    // skipped bytes — `out[1]` ended up reading the byte at offset 2, etc.
+    // Caught only after moving SQLiteJVMTest's text/blob round-trip into
+    // commonTest, where the K/N side ran for the first time against a
+    // getBlob() that wasn't masked by vec_distance_cosine's own read path.
+    for (i in 0 until size) {
+        out[i] = this[i]
     }
     return out
 }

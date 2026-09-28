@@ -17,7 +17,7 @@ platforms (iOS / macOS / tvOS / watchOS, devices and simulators), and Android
 targets — both are built from the same C amalgamation). You open a connection,
 prepare statements, and read typed columns.
 
-Current version: **0.1.3**.
+Current version: **0.1.4**.
 
 ## Supported targets
 
@@ -67,17 +67,17 @@ and appending it to the `compileFile(...)` calls in `build.gradle.kts`.
 ## Versioning
 
 The published version is taken from the `GITHUB_REF_NAME` environment variable
-in CI (the tag itself, e.g. `0.1.3`) and falls back to `0.1.3` locally.
+in CI (the tag itself, e.g. `0.1.4`) and falls back to `0.1.4` locally.
 
 ## Installation
 
-Add the dependency to your KMP module (Gradle Kotlin DSL, 0.1.3):
+Add the dependency to your KMP module (Gradle Kotlin DSL, 0.1.4):
 
 ```kotlin
 kotlin {
     sourceSets {
         commonMain.dependencies {
-            implementation("pw.binom.db:ksqlite:0.1.3")
+            implementation("pw.binom.db:ksqlite:0.1.4")
         }
     }
 }

@@ -45,7 +45,16 @@ import kotlin.concurrent.withLock
  */
 internal object NativeLoader {
 
-    private const val VERSION = "0.1.0"
+    /*
+     * Cache-directory version. Derived from the jar's Implementation-Version
+     * manifest attribute (stamped in build.gradle.kts from project.version) so
+     * a published 0.1.4 extracts under ~/.cache/ksqlite/0.1.4/ instead of the
+     * hardcoded "0.1.0" every release accidentally shared. Falls back to "dev"
+     * when running from build/classes (tests, `gradle run`) where there is no
+     * jar manifest to read.
+     */
+    private val VERSION: String =
+        NativeLoader::class.java.`package`?.implementationVersion ?: "dev"
     private val loaded = ConcurrentHashMap.newKeySet<String>()
     private val extractLocks = ConcurrentHashMap<String, ReentrantLock>()
 

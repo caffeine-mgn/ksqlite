@@ -42,7 +42,14 @@ JNIEXPORT jlong JNICALL Java_pw_binom_db_ksqlite_SQLiteNative_open(
     (*env)->ReleaseStringUTFChars(env, jpath, path);
     if (rc != SQLITE_OK) {
         if (db != NULL) sqlite3_close(db);
-        return (jlong)rc;
+        /*
+         * SQLite error codes are small positive integers (e.g. 14 for
+         * SQLITE_CANTOPEN). Returning rc as the handle used to fall
+         * through the JVM-side `handle == 0L` guard and crash the JVM
+         * on the first dereference inside sqlite3_total_changes / exec.
+         * The Kotlin layer expects 0L == open failure, so signal that.
+         */
+        return (jlong)0;
     }
     return (jlong)(intptr_t)db;
 }
