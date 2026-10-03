@@ -319,6 +319,18 @@ kotlin {
             compileFile(file("${JVM_JNI_SRC_DIR}/ksqlite_jni.c"))
             optimizationLevel(2)
         }.also { dynamicTask ->
+            if (isAndroidTarget) {
+                // Pull the bionic toolchain + sysroot first. kn-clang registers
+                // a per-target `downloadKonanToolchain*` task, but it only runs
+                // when a Kotlin/Native task for that target is in the graph;
+                // building the AAR alone does not schedule one, so on a cold
+                // machine (fresh CI cache) the sysroot is absent and the onlyIf
+                // below would silently skip the build — shipping an AAR with no
+                // jni libs. Depend on the download explicitly.
+                dynamicTask.dependsOn(
+                    tasks.named("downloadKonanToolchain${target.name.replaceFirstChar { it.uppercase() }}")
+                )
+            }
             // Cross-targets gracefully no-op when the host can't build them:
             // missing JDK headers / sysroot make the cross-compile impossible
             // on this machine. Keeping the task registered means `gradle tasks`
@@ -328,11 +340,9 @@ kotlin {
                 val jdkIncludeOk = jdkInclude.isNotEmpty() && jdkIncludePlatform.isNotEmpty()
                 dynamicTask.onlyIf("${target.name} toolchain available") {
                     if (isAndroidTarget) {
-                        // kn-clang's Konan.downloader already pulled the NDK sysroot
-                        // into KONAN_DATA_DIR/dependencies; if it's missing the
-                        // dependency download task would itself fail loudly. Here
-                        // we just skip silently so a host without NDK doesn't error
-                        // out — the jar simply won't carry the matching .so.
+                        // Belt-and-braces check after the download task above
+                        // has run; if the toolchain still isn't there we skip
+                        // rather than fail the whole build.
                         konanNdkDir(target).exists()
                     } else {
                         jdkIncludeOk
