@@ -12,6 +12,7 @@ import org.jetbrains.kotlin.konan.target.KonanTarget
 import java.util.Base64
 
 plugins {
+    alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kn.clang)
     alias(libs.plugins.dokka)
@@ -21,6 +22,7 @@ plugins {
 allprojects {
     repositories {
         mavenLocal()
+        google()
         mavenCentral()
         gradlePluginPortal()
     }
@@ -49,6 +51,17 @@ val NATIVE_INCLUDE_DIRS = listOf(
     file("${layout.projectDirectory}/src/nativeMain/c"),
 )
 val JVM_JNI_SRC_DIR = file("${layout.projectDirectory}/src/jvmMain/c")
+
+/*
+ * jniLibs tree packaged into the Android AAR: <abi>/libksqlite.so. AGP copies
+ * everything under this directory into the AAR's jni/<abi>/ folder, and from
+ * there the consumer's APK gets it under lib/<abi>/libksqlite.so — the only
+ * location the Android linker will load a native library from. The copy tasks
+ * that populate it are collected in [androidNativeCopyTasks] and wired into
+ * AGP's `preBuild` below.
+ */
+val ANDROID_JNI_LIBS_DIR = layout.buildDirectory.dir("androidJniLibs")
+val androidNativeCopyTasks = mutableListOf<TaskProvider<*>>()
 
 /*
  * Path to the Android NDK sysroot bundled into KONAN_DATA_DIR/dependencies.
@@ -117,10 +130,43 @@ tasks.withType<Test>().configureEach {
 }
 
 kotlin {
+    // Extend the default hierarchy template with a jvm+android shared group.
+    // Doing it here (rather than manual dependsOn calls) keeps the template
+    // applied, so `nativeMain`/`appleMain`/... still exist for the K/N targets.
+    // The group creates the `jvmSharedMain` source set (src/jvmSharedMain).
+    applyDefaultHierarchyTemplate {
+        common {
+            group("jvmShared") {
+                withJvm()
+                withAndroidTarget()
+            }
+        }
+    }
+
     jvm {
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_17)
         }
+    }
+
+    // Android JVM/ART delivery. This produces the AAR that carries the shared
+    // jvmSharedMain code plus the bionic `libksqlite.so` per ABI through
+    // `jniLibs` (see the Android section below). It is independent from the
+    // `androidNative*` Kotlin/Native targets further down, which build klibs
+    // for Kotlin/Native consumers.
+    androidTarget {
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_17)
+        }
+        /*
+         * Publish both Android build types. Only `release` is wired by default,
+         * but an Android application's runtime classpath carries
+         * `BuildTypeAttr=debug`. Without a matching `debug` variant Gradle has
+         * no exact android candidate and silently falls back to `ksqlite-jvm`
+         * (the jar-based variant, no jniLibs, cannot load on Android), so the
+         * `debug` variant must be published too.
+         */
+        publishLibraryVariants("release", "debug")
     }
 
     // Posix-family K/N targets. appleMain/macosMain hierarchy is auto-derived.
@@ -188,8 +234,7 @@ kotlin {
 
     /*
      * Build the JVM-side dynamic library: SQLite + sqlite-vec + ksqlite_jni.c
-     * into a shared object that we bundle into the jar and load at runtime
-     * via NativeLoader (see jvmMain/.../NativeLoader.kt). ksqlite_jni.c's
+     * into a shared object that is loaded at runtime via JNI. ksqlite_jni.c's
      * JNI_OnLoad() registers sqlite3_vec_init with sqlite3_auto_extension so
      * every new connection picks up vec0 with no caller wiring.
      *
@@ -199,13 +244,17 @@ kotlin {
      * clang cannot cross-compile to Linux/Windows from Darwin without SDK
      * hacking, mirroring the klua convention).
      *
-     * Android JNI libs (android_arm32, android_arm64, android_x86, android_x64)
-     * are built for any host that has the NDK sysroot already cached under
-     * ~/.konan/dependencies/target-sysroot-1-android_ndk — that's where
-     * kn-clang's Konan downloader places it on first use. The .so is bundled
-     * into the jar under /android_<arch>/libksqlite.so and unpacked by
-     * NativeLoader on first access on the device (Dalvik/ART VM is detected
-     * via `java.vendor == "The Android Project"` and `os.arch`).
+     * The desktop targets are copied into the JVM jar under
+     * /<target>/libksqlite.<ext> and loaded by NativeLoader (jvmMain).
+     *
+     * The Android ABI builds (android_arm32, android_arm64, android_x86,
+     * android_x64) are built for any host that has the NDK toolchain cached in
+     * KONAN_DATA_DIR/dependencies. They are NOT put into the JVM jar — a .so
+     * extracted from a jar cannot be dlopen'd on modern Android (linker
+     * namespace + SELinux) — instead they populate the AAR's jniLibs tree, see
+     * [androidNativeCopyTasks] below. (The androidNative* Kotlin/Native
+     * targets elsewhere in this file are unrelated klib builds for
+     * Kotlin/Native consumers, not the Android JVM/ART path.)
      */
     val currentHost = HostManager.host
     val isMacHost = currentHost == KonanTarget.MACOS_X64 ||
@@ -252,6 +301,12 @@ kotlin {
             konanVersion.set(KOTLIN_VERSION)
             compileArgs("-std=gnu99", "-fno-rtti")
             compileArgs(*SQLITE_COMPILE_FLAGS.toTypedArray())
+            // FTS3/4/5 use log() for IDF ranking, so the shared object must
+            // link libm explicitly. Without it glibc resolves log lazily and
+            // desktop JVM happens to work, but the Android linker resolves
+            // every symbol at dlopen time and aborts with
+            // `cannot locate symbol "log"` (verified on API 36 x86_64).
+            linkArgs("-lm")
             NATIVE_INCLUDE_DIRS.forEach { include(it) }
             include(JVM_JNI_SRC_DIR)
             if (!isAndroidTarget) {
@@ -287,7 +342,11 @@ kotlin {
         }
     }
 
-    val jvmCopyTasks = jvmBuildTasks.mapValues { (target, buildTask) ->
+    // Only the desktop targets go into the JVM jar; the Android ABI `.so` are
+    // shipped in the AAR's jniLibs instead (see the copy tasks below).
+    val jvmCopyTasks = jvmBuildTasks
+        .filterKeys { it.family != Family.ANDROID }
+        .mapValues { (target, buildTask) ->
         val libExt = when (target.family) {
             Family.MINGW -> "dll"
             Family.OSX, Family.IOS, Family.TVOS, Family.WATCHOS -> "dylib"
@@ -307,6 +366,28 @@ kotlin {
         copyTask
     }
 
+    /*
+     * Android ABI -> jniLibs folder name. AGP only packages `lib/<abi>/...`
+     * for these exact ABI directory names. The clangBuildDynamic tasks above
+     * already produce the bionic .so, so we just copy each into the jniLibs
+     * tree that `android { sourceSets["main"].jniLibs.srcDir(...) }` consumes.
+     * `preBuild` is wired to [androidNativeCopyTasks] below.
+     */
+    val androidAbiByTarget = linkedMapOf(
+        KonanTarget.ANDROID_ARM64 to "arm64-v8a",
+        KonanTarget.ANDROID_X64 to "x86_64",
+        KonanTarget.ANDROID_ARM32 to "armeabi-v7a",
+        KonanTarget.ANDROID_X86 to "x86",
+    )
+    androidNativeCopyTasks += androidAbiByTarget.map { (target, abi) ->
+        val buildTask = jvmBuildTasks.getValue(target)
+        tasks.register("copyAndroidKsqlite${target.name}", Copy::class.java) {
+            from(buildTask.dynamicFile)
+            rename { "libksqlite.so" }
+            into(ANDROID_JNI_LIBS_DIR.get().dir(abi))
+        }
+    }
+
     sourceSets {
         val commonMain by getting {
             dependencies {
@@ -319,6 +400,10 @@ kotlin {
                 implementation(kotlin("test-annotations-common"))
             }
         }
+        // `jvmSharedMain` (shared JVM/Android code) is created by the
+        // applyDefaultHierarchyTemplate group above; Android reuses the entire
+        // JNI-backed implementation and only swaps how the native library is
+        // loaded (see NativeLibraryLoader.kt).
         val jvmMain by getting {
             dependencies {
                 api("org.jetbrains.kotlin:kotlin-stdlib:$KOTLIN_VERSION")
@@ -338,6 +423,36 @@ kotlin {
             from(layout.buildDirectory.dir("processed-resources/native"))
             include("**/*.so", "**/*.dylib", "**/*.dll")
         }
+    }
+}
+
+/*
+ * Android library (AAR) packaging. `androidTarget()` above compiles the Kotlin
+ * side; this block adds the namespace/manifest configuration and points the
+ * `jniLibs` source set at the tree of bionic `.so` produced by the
+ * copyAndroidKsqlite* tasks. `preBuild` is made to depend on those copies so
+ * the files are present before AGP assembles the AAR (each copy task depends
+ * on the matching kn-clang clangBuildDynamic task).
+ */
+android {
+    namespace = "pw.binom.db.ksqlite"
+    compileSdk = 35
+
+    defaultConfig {
+        minSdk = 24
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    sourceSets["main"].jniLibs.srcDir(ANDROID_JNI_LIBS_DIR)
+}
+
+afterEvaluate {
+    tasks.named("preBuild") {
+        dependsOn(androidNativeCopyTasks)
     }
 }
 

@@ -7,15 +7,17 @@
 [![sqlite-vec](https://img.shields.io/badge/sqlite--vec-0.1.9-blueviolet.svg)](https://github.com/asg017/sqlite-vec)
 
 A pure SQLite library for Kotlin Multiplatform. The C amalgamation (`sqlite3.c`,
-plus extensions) is linked straight into every native klib, and on the JVM a
-single JNI `.so` is built and loaded at runtime — there is no third-party JDBC
-driver, no `sqlite-jdbc` on the classpath, no Java-side shadow of the engine.
+plus extensions) is linked straight into every native klib; on the desktop JVM a
+JNI `.so` is built and loaded at runtime, and on Android the same bionic `.so` is
+shipped inside an AAR (`jniLibs`) and loaded through `System.loadLibrary` — there
+is no third-party JDBC driver, no `sqlite-jdbc` on the classpath, no Java-side
+shadow of the engine.
 
 The API is identical across JVM, Linux/macOS/Windows native, all of Apple's
 platforms (iOS / macOS / tvOS / watchOS, devices and simulators), and Android
-(either the regular JVM bytecode variant or `androidNative*` Kotlin/Native
-targets — both are built from the same C amalgamation). You open a connection,
-prepare statements, and read typed columns.
+(the AAR for JVM/ART apps or the `androidNative*` Kotlin/Native targets — both
+are built from the same C amalgamation). You open a connection, prepare
+statements, and read typed columns.
 
 Current version: **0.1.4**.
 
@@ -23,8 +25,8 @@ Current version: **0.1.4**.
 
 | Target                                       | Backend                                         |
 |----------------------------------------------|-------------------------------------------------|
-| `jvm` (any host: linux/macOS/windows)        | dynamic `.so` / `.dylib` / `.dll` loaded via JNI |
-| `jvm` on Android (Dalvik/ART, all 4 ABIs)    | dynamic `.so` bundled in the JAR, loaded via JNI  |
+| `jvm` (desktop: linux/macOS/windows)         | dynamic `.so` / `.dylib` / `.dll` loaded via JNI |
+| `android` (Dalvik/ART, all 4 ABIs)           | AAR: bionic `.so` under `jniLibs`, loaded via `System.loadLibrary` |
 | `linuxX64`, `linuxArm64`                     | static C amalgamation linked into the klib     |
 | `macosX64`, `macosArm64`                     | static C amalgamation linked into the klib     |
 | `iosX64`, `iosArm64`, `iosSimulatorArm64`    | static C amalgamation linked into the klib     |
@@ -83,15 +85,15 @@ kotlin {
 }
 ```
 
-The native targets pull the right static klib automatically. On the JVM
-nothing extra is required — the native library is built by Gradle at compile
+The native targets pull the right static klib automatically. On the desktop
+JVM nothing extra is required — the native library is built by Gradle at compile
 time and extracted on first use into the user's cache directory (see
-`NativeLoader`). The Android JVM JAR carries four `.so` files
-(`android_arm32/libksqlite.so`, `android_arm64/libksqlite.so`,
-`android_x86/libksqlite.so`, `android_x64/libksqlite.so`); `NativeLoader`
-detects Dalvik/ART at runtime via `java.vendor` / `java.vm.name` and picks
-the matching one. If the host ABI's `.so` is missing from the JAR the loader
-throws an explicit `IllegalStateException` listing the supported ones.
+`NativeLoader`). Android resolves the same coordinate to an AAR that carries the
+bionic `.so` per ABI under `jni/<abi>/libksqlite.so` (AGP installs them into
+`lib/<abi>/` of the APK); the `androidMain` source set loads them with
+`System.loadLibrary("ksqlite")` — no extraction and no writable-path
+requirement. If the desktop host platform has no bundled `.so` the loader throws
+an explicit `IllegalStateException` listing the supported ones.
 
 ## Examples
 
@@ -279,6 +281,7 @@ val name     = conn.queryForString("SELECT name FROM users WHERE id = ?", 0, 42L
 ./gradlew build           # compile every configured target
 ./gradlew jvmTest         # run the JVM tests (builds + loads the .so)
 ./gradlew linuxX64Test    # run the linuxX64 tests
+./gradlew assembleDebug    # build the Android AAR (needs ANDROID_HOME or local.properties sdk.dir)
 ```
 
 Other natives (`macosArm64`, `iosArm64`, `mingwX64`, …) are skipped on Linux
@@ -294,3 +297,19 @@ copies that artifact into the user's cache directory
 (`~/.cache/ksqlite` on Linux, the equivalent of `XDG_CACHE_HOME` elsewhere)
 and verifies it with the SHA-256 hash baked into the JAR. No `/tmp` paths,
 no mutable global state.
+
+Android does **not** use `NativeLoader`. The `.so` files are built by the same
+`clangBuildDynamic` tasks (targeting the NDK/bionic toolchain), copied into
+`build/androidJniLibs/<abi>/libksqlite.so` and packaged into the AAR by AGP so
+they end up in `lib/<abi>/` of the consuming APK. The `androidMain` actual of
+`loadNativeLibrary` simply calls `System.loadLibrary("ksqlite")` — the only
+loading mechanism the Android linker permits for an app's own native
+libraries (unpacking a `.so` from the JAR into app storage and calling
+`System.load` is blocked by the linker namespace and SELinux on API 24+).
+
+Both Android build types (`release` and `debug`) are published. An Android
+application's runtime classpath carries the `debug` build-type attribute, so
+without a matching `debug` variant Gradle would find no exact Android candidate
+and silently fall back to the plain `ksqlite-jvm` JAR (which has no `jniLibs`
+and cannot load on Android). Publishing both variants — `publishLibraryVariants`
+on `androidTarget` — guarantees the AAR is selected.

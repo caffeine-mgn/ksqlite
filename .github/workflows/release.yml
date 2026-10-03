@@ -40,6 +40,17 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # The Android target builds an AAR (com.android.library) and needs a
+      # regular Android SDK for the platform jar and build-tools. The NDK is
+      # NOT required here: kn-clang's Konan downloader fetches its own
+      # bionic toolchain into KONAN_DATA_DIR on first Android build. Gradle
+      # also reads the sdk.dir from local.properties OR the ANDROID_HOME
+      # environment variable exported by setup-android.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+
       # ksqlite links a SQLite + sqlite-vec amalgamation straight into
       # every native klib via clangBuildStatic, and on the JVM clangBuildDynamic
       # produces the .so that NativeLoader extracts at runtime. Linux
@@ -64,6 +75,18 @@ jobs:
           echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           gpgconf --reload gpg-agent
+
+      # Fail fast if the Android AAR drops an ABI: each of the four
+      # androidNative* JNI targets must end up as jni/<abi>/libksqlite.so,
+      # otherwise Android apps would silently miss vector/DB support on that
+      # ABI. This mirrors the ABI check klua runs for its own AAR.
+      - name: Verify Android AAR carries all four ABIs
+        run: |
+          ./gradlew assembleRelease
+          aar=build/outputs/aar/ksqlite-release.aar
+          unzip -l "$aar" | grep -E 'jni/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksqlite\.so'
+          count=$(unzip -l "$aar" | grep -c 'jni/.*/libksqlite\.so')
+          test "$count" -eq 4 || { echo "expected 4 native libs in AAR, found $count"; exit 1; }
 
       - name: Publish to Maven Central
         env:

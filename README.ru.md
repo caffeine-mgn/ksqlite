@@ -7,13 +7,15 @@
 [![sqlite-vec](https://img.shields.io/badge/sqlite--vec-0.1.9-blueviolet.svg)](https://github.com/asg017/sqlite-vec)
 
 Чистая SQLite-библиотека для Kotlin Multiplatform. C-амáльгама (`sqlite3.c`
-плюс расширения) линкуется прямо в каждый нативный klib, а на JVM единственный
-JNI `.so` собирается и загружается в рантайме — никакого стороннего JDBC-драйвера,
-никакого `sqlite-jdbc` в classpath, никакой Java-обёртки поверх движка.
+плюс расширения) линкуется прямо в каждый нативный klib; на десктопном JVM
+JNI `.so` собирается и загружается в рантайме, а на Android тот же bionic `.so`
+поставляется внутри AAR (`jniLibs`) и грузится через `System.loadLibrary` —
+никакого стороннего JDBC-драйвера, никакого `sqlite-jdbc` в classpath, никакой
+Java-обёртки поверх движка.
 
 API идентично на JVM, нативных таргетах Linux/macOS/Windows, всех платформах
 Apple (iOS / macOS / tvOS / watchOS, устройства и симуляторы) и Android
-(как обычная JVM-байткод-вариант, так и `androidNative*` Kotlin/Native таргеты —
+(AAR для JVM/ART-приложений либо `androidNative*` Kotlin/Native таргеты —
 обе собираются из одной и той же C-амáльгамы). Открываете соединение,
 готовите запросы, читаете типизированные колонки.
 
@@ -23,8 +25,8 @@ Apple (iOS / macOS / tvOS / watchOS, устройства и симулятор�
 
 | Таргет                                       | Бэкенд                                            |
 |----------------------------------------------|---------------------------------------------------|
-| `jvm` (любой хост: linux/macOS/windows)      | динамическая `.so` / `.dylib` / `.dll`, загружается через JNI |
-| `jvm` на Android (Dalvik/ART, все 4 ABI)     | динамическая `.so`, упакованная в JAR, грузится через JNI |
+| `jvm` (десктоп: linux/macOS/windows)         | динамическая `.so` / `.dylib` / `.dll`, загружается через JNI |
+| `android` (Dalvik/ART, все 4 ABI)            | AAR: bionic `.so` в `jniLibs`, грузится через `System.loadLibrary` |
 | `linuxX64`, `linuxArm64`                     | статическая C-амáльгама, залинкованная в klib      |
 | `macosX64`, `macosArm64`                     | статическая C-амáльгама, залинкованная в klib      |
 | `iosX64`, `iosArm64`, `iosSimulatorArm64`    | статическая C-амáльгама, залинкованная в klib      |
@@ -82,15 +84,15 @@ kotlin {
 }
 ```
 
-Нативные таргеты автоматически подтягивают нужный статический klib. На JVM
-ничего дополнительного не требуется — нативная библиотека собирается Gradle
+Нативные таргеты автоматически подтягивают нужный статический klib. На десктопном
+JVM ничего дополнительного не требуется — нативная библиотека собирается Gradle
 во время компиляции и распаковывается при первом использовании в пользовательский
-кэш-каталог (см. `NativeLoader`). В JAR для JVM-Android зашиты четыре `.so`
-(`android_arm32/libksqlite.so`, `android_arm64/libksqlite.so`,
-`android_x86/libksqlite.so`, `android_x64/libksqlite.so`); `NativeLoader`
-определяет Dalvik/ART на старте по `java.vendor` / `java.vm.name` и выбирает
-нужный. Если `.so` для текущего ABI в JAR отсутствует, загрузчик падает с
-явным `IllegalStateException` со списком поддерживаемых ABI.
+кэш-каталог (см. `NativeLoader`). Android резолвит ту же координату в AAR, который
+несёт bionic `.so` под каждый ABI в `jni/<abi>/libksqlite.so` (AGP раскладывает их
+в `lib/<abi>/` APK); source set `androidMain` грузит их через
+`System.loadLibrary("ksqlite")` — без распаковки и без требования к записываемому
+пути. Если для десктопного хоста в JAR нет подходящего `.so`, загрузчик падает с
+явным `IllegalStateException` со списком поддерживаемых.
 
 ## Примеры
 
@@ -276,6 +278,7 @@ val name     = conn.queryForString("SELECT name FROM users WHERE id = ?", 0, 42L
 ./gradlew build           # compile every configured target
 ./gradlew jvmTest         # run the JVM tests (builds + loads the .so)
 ./gradlew linuxX64Test    # run the linuxX64 tests
+./gradlew assembleDebug    # собрать Android AAR (нужен ANDROID_HOME или sdk.dir в local.properties)
 ```
 
 Остальные нативные таргеты (`macosArm64`, `iosArm64`, `mingwX64`, …)
@@ -290,3 +293,19 @@ JVM-таргет поставляет только байткод и единс�
 в пользовательский кэш-каталог (`~/.cache/ksqlite` на Linux, эквивалент
 `XDG_CACHE_HOME` в других ОС) и проверяет его по SHA-256-хешу, вшитому в JAR.
 Никаких путей в `/tmp`, никакого мутируемого глобального состояния.
+
+Android **не** использует `NativeLoader`. `.so` собираются теми же задачами
+`clangBuildDynamic` (под NDK/bionic тулчейн), копируются в
+`build/androidJniLibs/<abi>/libksqlite.so` и пакуются AGP в AAR, откуда попадают
+в `lib/<abi>/` итогового APK. Actual `loadNativeLibrary` в `androidMain` просто
+вызывает `System.loadLibrary("ksqlite")` — единственный способ загрузки, который
+линкер Android разрешает для собственных нативных библиотек приложения
+(распаковка `.so` из JAR в хранилище приложения и `System.load` блокируются
+linker namespace и SELinux на API 24+).
+
+Публикуются оба build type Android (`release` и `debug`). Runtime classpath
+Android-приложения несёт атрибут `debug`, поэтому без варианта `debug` Gradle
+не находит точного Android-кандидата и молча откатывается на обычный JAR
+`ksqlite-jvm` (в нём нет `jniLibs`, и он не загрузится на Android). Публикация
+обоих вариантов — `publishLibraryVariants` на `androidTarget` — гарантирует
+выбор AAR.

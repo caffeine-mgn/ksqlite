@@ -15,10 +15,10 @@ import kotlin.test.assertNotNull
  *  - the host-platform fallback path when the jar has no build for the
  *    current `os.arch`
  *
- * Anything that should run on Android (Dalvik/ART) belongs in a separate
- * Android-only test class because that runtime's `os.name=Linux` +
- * `java.vendor="The Android Project"` detection is exercised by the device
- * itself, not by unit tests in this module.
+ * Anything Android-specific is not covered here: Android is delivered as an
+ * AAR whose `jniLibs` are loaded through `System.loadLibrary` (see the
+ * `androidMain` actual of `loadNativeLibrary`), so that path is exercised on a
+ * device/emulator, not by unit tests in this module.
  */
 class SQLiteJVMTest {
 

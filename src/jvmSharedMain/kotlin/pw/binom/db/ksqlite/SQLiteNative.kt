@@ -16,7 +16,7 @@ package pw.binom.db.ksqlite
  */
 internal object SQLiteNative {
 
-    fun load() = NativeLoader.load()
+    fun load() = loadNativeLibrary()
 
     @JvmStatic external fun open(path: String, flags: Int): Long
     @JvmStatic external fun close(handle: Long): Int
