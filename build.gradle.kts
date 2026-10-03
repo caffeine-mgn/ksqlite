@@ -32,13 +32,13 @@ group = "pw.binom.db"
 val PROP_VERSION = findProperty("version") as String?
 val ENV_VERSION = System.getenv("GITHUB_REF_NAME")?.removePrefix("v")
 // Gradle's default project.version is the literal string "unspecified" (not
-// null), so a plain `?: "0.1.4"` chain never reaches the fallback when the
+// null), so a plain `?: "0.1.5"` chain never reaches the fallback when the
 // `version=` Gradle property is missing — `findProperty("version")` returns
 // "unspecified" instead of null. We have to explicitly guard against it.
 version = when {
     !PROP_VERSION.isNullOrBlank() && PROP_VERSION != "unspecified" -> PROP_VERSION
     !ENV_VERSION.isNullOrBlank() && ENV_VERSION != "unspecified" -> ENV_VERSION
-    else -> "0.1.4"
+    else -> "0.1.5"
 }
 
 val KOTLIN_VERSION = "2.4.20"
