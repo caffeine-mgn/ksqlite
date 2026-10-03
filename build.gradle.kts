@@ -3,9 +3,9 @@ import pw.binom.kotlin.clang.clangBuildDynamic
 import pw.binom.kotlin.clang.clangBuildStatic
 import pw.binom.kotlin.clang.compileTaskName
 import pw.binom.kotlin.clang.eachNative
+import org.gradle.api.Task
 import org.gradle.plugins.signing.SigningExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask
 import org.jetbrains.kotlin.konan.target.Family
 import org.jetbrains.kotlin.konan.target.HostManager
@@ -205,6 +205,7 @@ kotlin {
      * ksqlite_init() once at process start; from that point every sqlite3_open*
      * call automatically loads sqlite-vec, exposing vec0 et al.
      */
+    val nativeStaticTaskByKonanTarget = mutableMapOf<KonanTarget, Task>()
     eachNative {
         val sqliteStaticTask = clangBuildStatic(target = konanTarget, name = "sqlitevec") {
             konanVersion.set(KOTLIN_VERSION)
@@ -217,6 +218,14 @@ kotlin {
             compileFile(file("${layout.projectDirectory}/src/nativeMain/c/ksqlite_wrappers.c"))
             optimizationLevel(2)
         }
+        // kn-clang's clang tasks need the Kotlin/Native distribution unpacked
+        // under ~/.konan, but its own `downloadKonan` fetches it from a URL that
+        // 404s for Kotlin >= 2.x (the release asset gained a `prebuilt-`
+        // infix). Depend on KGP's working `downloadKotlinNativeDistribution`
+        // instead; each target's sysroot/toolchain is then downloaded by
+        // kn-clang's own `checkSysrootInstalled` when the task runs.
+        sqliteStaticTask.dependsOn(tasks.named("downloadKotlinNativeDistribution"))
+        nativeStaticTaskByKonanTarget[konanTarget] = sqliteStaticTask
         tasks.findByName(compileTaskName)?.dependsOn(sqliteStaticTask)
 
         binaries {
@@ -275,19 +284,6 @@ kotlin {
         if (isMacHost) add(currentHost)
     }
 
-    // KGP registers a `compileKotlin<Target>` task per native target; it (and
-    // the `downloadKotlinNativeDistribution` task behind it, plus the target's
-    // cinterop/static dependencies) is what pulls the Android NDK
-    // toolchain/sysroot into KONAN_DATA_DIR. The standalone clangBuildDynamic
-    // tasks below do not trigger that download, so on a cold machine (fresh CI
-    // cache) the sysroot is absent and the Android onlyIf would silently skip
-    // every `.so` — exactly how the AAR ended up with no jni libs. Map each
-    // KonanTarget to its KGP compile task so the Android dynamic builds can
-    // depend on it and the toolchain is guaranteed to be present.
-    val knCompileTaskByKonanTarget = targets
-        .withType(KotlinNativeTarget::class.java)
-        .associate { it.konanTarget to it.compileTaskName }
-
     val jdkHome = System.getenv("JAVA_HOME")
     val jdkIncludeCandidates = listOfNotNull(
         jdkHome?.let { "$it/include" },
@@ -333,14 +329,17 @@ kotlin {
             compileFile(file("${JVM_JNI_SRC_DIR}/ksqlite_jni.c"))
             optimizationLevel(2)
         }.also { dynamicTask ->
+            // kn-clang's dynamic build needs the Kotlin/Native distribution
+            // unpacked under ~/.konan; its own `downloadKonan` fetches it from a
+            // URL that 404s on Kotlin >= 2.x (release asset gained a `prebuilt-`
+            // infix), so use KGP's working `downloadKotlinNativeDistribution`.
+            dynamicTask.dependsOn(tasks.named("downloadKotlinNativeDistribution"))
             if (isAndroidTarget) {
-                // Ensure the NDK toolchain/sysroot is present before the onlyIf
-                // below is evaluated: the Kotlin/Native compile task for this
-                // target downloads it (KGP fetches both the Kotlin/Native
-                // distribution and the Android target dependencies). Without
-                // this a cold machine silently skips the build and ships an AAR
-                // with no jni libs.
-                dynamicTask.dependsOn(knCompileTaskByKonanTarget.getValue(target))
+                // The Android dynamic build also needs the bionic sysroot
+                // toolchain extracted into KONAN_DATA_DIR before the onlyIf
+                // below is evaluated; the static build for the same target does
+                // that download via kn-clang's `checkSysrootInstalled`.
+                dynamicTask.dependsOn(nativeStaticTaskByKonanTarget.getValue(target))
             }
             // Cross-targets gracefully no-op when the host can't build them:
             // missing JDK headers / sysroot make the cross-compile impossible
