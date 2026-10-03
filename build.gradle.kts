@@ -33,13 +33,13 @@ group = "pw.binom.db"
 val PROP_VERSION = findProperty("version") as String?
 val ENV_VERSION = System.getenv("GITHUB_REF_NAME")?.removePrefix("v")
 // Gradle's default project.version is the literal string "unspecified" (not
-// null), so a plain `?: "0.1.5"` chain never reaches the fallback when the
+// null), so a plain `?: "0.1.6"` chain never reaches the fallback when the
 // `version=` Gradle property is missing — `findProperty("version")` returns
 // "unspecified" instead of null. We have to explicitly guard against it.
 version = when {
     !PROP_VERSION.isNullOrBlank() && PROP_VERSION != "unspecified" -> PROP_VERSION
     !ENV_VERSION.isNullOrBlank() && ENV_VERSION != "unspecified" -> ENV_VERSION
-    else -> "0.1.5"
+    else -> "0.1.6"
 }
 
 val KOTLIN_VERSION = "2.4.20"
@@ -68,11 +68,13 @@ val androidNativeCopyTasks = mutableListOf<TaskProvider<*>>()
  * Path to the Android NDK sysroot bundled into KONAN_DATA_DIR/dependencies.
  * kn-clang's Konan dependency downloader unpacks `target-sysroot-1-android_ndk`
  * and `target-toolchain-2-{linux,osx,windows}-android_ndk` here the first
- * time an Android KonanTarget is requested; once present, kn-clang can
- * cross-compile for any of {android_arm32, android_arm64, android_x86,
- * android_x64} from a Linux/macOS/Windows host. We probe this directory
- * before scheduling the JNI cross-build so a host without the NDK can
- * silently skip the Android tasks instead of failing mid-link.
+ * time an Android KonanTarget's sysroot is requested (via
+ * `checkSysrootInstalled`, normally reached through a static build for the
+ * same target); once present, kn-clang can cross-compile for any of
+ * {android_arm32, android_arm64, android_x86, android_x64} from a
+ * Linux/macOS/Windows host. We probe this directory before scheduling the JNI
+ * cross-build so a host without the NDK can silently skip the Android tasks
+ * instead of failing mid-link.
  */
 fun konanNdkDir(target: KonanTarget): File {
     val konanDataDir = System.getenv("KONAN_DATA_DIR")?.let { File(it) }
@@ -218,12 +220,15 @@ kotlin {
             compileFile(file("${layout.projectDirectory}/src/nativeMain/c/ksqlite_wrappers.c"))
             optimizationLevel(2)
         }
-        // kn-clang's clang tasks need the Kotlin/Native distribution unpacked
-        // under ~/.konan, but its own `downloadKonan` fetches it from a URL that
-        // 404s for Kotlin >= 2.x (the release asset gained a `prebuilt-`
-        // infix). Depend on KGP's working `downloadKotlinNativeDistribution`
-        // instead; each target's sysroot/toolchain is then downloaded by
-        // kn-clang's own `checkSysrootInstalled` when the task runs.
+        // kn-clang (>= 0.1.21) can install the Kotlin/Native distribution
+        // itself, on demand, from the correct `kotlin-native-prebuilt-*` asset.
+        // But this is a KMP project, so KGP's own `downloadKotlinNativeDistribution`
+        // may be scheduled for the native klib targets too; with
+        // org.gradle.parallel=true the two installers could race on the same
+        // ~/.konan/kotlin-native-prebuilt-* directory. Keep KGP's task as an
+        // explicit ordering anchor so it wins and the plugin's install is a
+        // no-op — the old 0.0.6 URL/partial-install workaround is no longer why
+        // this dependency exists.
         sqliteStaticTask.dependsOn(tasks.named("downloadKotlinNativeDistribution"))
         nativeStaticTaskByKonanTarget[konanTarget] = sqliteStaticTask
         tasks.findByName(compileTaskName)?.dependsOn(sqliteStaticTask)
@@ -292,6 +297,22 @@ kotlin {
     )
     val jdkInclude = jdkIncludeCandidates.firstOrNull { File(it).exists() } ?: ""
 
+    // JDK platform include subdir for the *host* OS (`include/linux`, `win32`,
+    // `darwin`). Used as the fallback for cross-targets whose own platform dir
+    // the JDK doesn't ship (e.g. no `include/win32` on a Linux JDK) — see below.
+    val hostJdkPlatform = when (HostManager.host.family) {
+        Family.MINGW -> "win32"
+        Family.OSX, Family.IOS, Family.TVOS, Family.WATCHOS -> "darwin"
+        else -> "linux"
+    }
+
+    // The JDK's platform `jni_md.h` for a cross-target is only relevant on
+    // Windows (where it defines the `__declspec` calling convention); the
+    // Linux/macOS one compiles fine everywhere else and is all a Linux CI host
+    // has. Keep the per-family lookup only to demonstrate the intent, but never
+    // let an unavailable platform dir (e.g. `include/win32` on a Linux JDK)
+    // disqualify the cross-compile — that silently SKIPPED the mingw_x64 .dll
+    // on CI (no Windows JDK) and left the JVM jar Windows-less.
     val jvmBuildTasks = jvmHostTargets.associateWith { target ->
         val isAndroidTarget = target.family == Family.ANDROID
         val platform = when (target.family) {
@@ -305,7 +326,15 @@ kotlin {
             "/usr/lib/jvm/java-21-openjdk/include/$platform",
             "/usr/lib/jvm/default-java/include/$platform",
         )
-        val jdkIncludePlatform = jdkIncludePlatformCandidates.firstOrNull { File(it).exists() } ?: ""
+        // The platform `jni_md.h` (`win32/` vs `linux/`) is picked for real, but
+        // only if the JDK actually ships one for the *cross* platform; a Linux
+        // JDK has no `include/win32`, so fall back to the JDK's *host* platform
+        // dir (`include/linux`), whose jni_md.h compiles just as well for mingw.
+        // Picking none at all is what silently SKIPPED the mingw_x64 .dll.
+        val jdkIncludePlatform = jdkIncludePlatformCandidates.firstOrNull { File(it).exists() }
+            ?: jdkHome?.let { "$it/include/$hostJdkPlatform" }?.takeIf { File(it).exists() }
+            ?: jdkIncludeCandidates.firstOrNull { File(it).exists() }
+            ?: ""
 
         clangBuildDynamic(target = target, name = "ksqlite") {
             konanVersion.set(KOTLIN_VERSION)
@@ -329,10 +358,9 @@ kotlin {
             compileFile(file("${JVM_JNI_SRC_DIR}/ksqlite_jni.c"))
             optimizationLevel(2)
         }.also { dynamicTask ->
-            // kn-clang's dynamic build needs the Kotlin/Native distribution
-            // unpacked under ~/.konan; its own `downloadKonan` fetches it from a
-            // URL that 404s on Kotlin >= 2.x (release asset gained a `prebuilt-`
-            // infix), so use KGP's working `downloadKotlinNativeDistribution`.
+            // Same ordering rationale as the static task above: serialize
+            // against KGP's own Kotlin/Native downloader so the two installers
+            // can't race on ~/.konan under parallel execution.
             dynamicTask.dependsOn(tasks.named("downloadKotlinNativeDistribution"))
             if (isAndroidTarget) {
                 // The Android dynamic build also needs the bionic sysroot
@@ -347,7 +375,6 @@ kotlin {
             // and IDEs still see the full target list.
             val needsCrossCompile = target != currentHost
             if (needsCrossCompile) {
-                val jdkIncludeOk = jdkInclude.isNotEmpty() && jdkIncludePlatform.isNotEmpty()
                 dynamicTask.onlyIf("${target.name} toolchain available") {
                     if (isAndroidTarget) {
                         // Belt-and-braces check after the download task above
@@ -355,7 +382,10 @@ kotlin {
                         // rather than fail the whole build.
                         konanNdkDir(target).exists()
                     } else {
-                        jdkIncludeOk
+                        // Only the base JDK include dir is required; the
+                        // platform subdir (`win32`/`linux`) is optional and the
+                        // base dir is used as a fallback (see above).
+                        jdkInclude.isNotEmpty()
                     }
                 }
             }
