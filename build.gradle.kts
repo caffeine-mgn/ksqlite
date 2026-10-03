@@ -5,6 +5,7 @@ import pw.binom.kotlin.clang.compileTaskName
 import pw.binom.kotlin.clang.eachNative
 import org.gradle.plugins.signing.SigningExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask
 import org.jetbrains.kotlin.konan.target.Family
 import org.jetbrains.kotlin.konan.target.HostManager
@@ -274,6 +275,19 @@ kotlin {
         if (isMacHost) add(currentHost)
     }
 
+    // KGP registers a `compileKotlin<Target>` task per native target; it (and
+    // the `downloadKotlinNativeDistribution` task behind it, plus the target's
+    // cinterop/static dependencies) is what pulls the Android NDK
+    // toolchain/sysroot into KONAN_DATA_DIR. The standalone clangBuildDynamic
+    // tasks below do not trigger that download, so on a cold machine (fresh CI
+    // cache) the sysroot is absent and the Android onlyIf would silently skip
+    // every `.so` — exactly how the AAR ended up with no jni libs. Map each
+    // KonanTarget to its KGP compile task so the Android dynamic builds can
+    // depend on it and the toolchain is guaranteed to be present.
+    val knCompileTaskByKonanTarget = targets
+        .withType(KotlinNativeTarget::class.java)
+        .associate { it.konanTarget to it.compileTaskName }
+
     val jdkHome = System.getenv("JAVA_HOME")
     val jdkIncludeCandidates = listOfNotNull(
         jdkHome?.let { "$it/include" },
@@ -320,16 +334,13 @@ kotlin {
             optimizationLevel(2)
         }.also { dynamicTask ->
             if (isAndroidTarget) {
-                // Pull the bionic toolchain + sysroot first. kn-clang registers
-                // a per-target `downloadKonanToolchain*` task, but it only runs
-                // when a Kotlin/Native task for that target is in the graph;
-                // building the AAR alone does not schedule one, so on a cold
-                // machine (fresh CI cache) the sysroot is absent and the onlyIf
-                // below would silently skip the build — shipping an AAR with no
-                // jni libs. Depend on the download explicitly.
-                dynamicTask.dependsOn(
-                    tasks.named("downloadKonanToolchain${target.name.replaceFirstChar { it.uppercase() }}")
-                )
+                // Ensure the NDK toolchain/sysroot is present before the onlyIf
+                // below is evaluated: the Kotlin/Native compile task for this
+                // target downloads it (KGP fetches both the Kotlin/Native
+                // distribution and the Android target dependencies). Without
+                // this a cold machine silently skips the build and ships an AAR
+                // with no jni libs.
+                dynamicTask.dependsOn(knCompileTaskByKonanTarget.getValue(target))
             }
             // Cross-targets gracefully no-op when the host can't build them:
             // missing JDK headers / sysroot make the cross-compile impossible
