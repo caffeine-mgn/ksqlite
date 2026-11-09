@@ -2,7 +2,6 @@ package pw.binom.db.ksqlite
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.atomic.AtomicBoolean
 
 @Suppress("EXPECT_ACTUAL_CLASSIFIERS_ARE_IN_BETA_WARNING")
 actual class SQLitePreparedStatement internal constructor(
@@ -10,97 +9,91 @@ actual class SQLitePreparedStatement internal constructor(
     internal val sql: String,
 ) : AutoCloseable {
 
-    private val stmt: Long
-    private val closed = AtomicBoolean(false)
+    /**
+     * Общий handle со всеми result set'ами, которые из него вышли: закрытие
+     * statement'а помечает его и больше не даёт нативным вызовам уйти на
+     * освобождённый `sqlite3_stmt`.
+     */
+    private val handle: StmtHandle
+    private val closed: Boolean
+        get() = handle.closed
 
     init {
-        conn.checkOpen()
-        val stmtOut = LongArray(1)
-        val rc = SQLiteNative.prepare(conn.handle, sql, stmtOut)
-        if (rc != SQLiteNative.sqliteOk() || stmtOut[0] == 0L) {
-            throw SQLiteException("prepare failed (code $rc): ${conn.errorMessage()} sql=$sql")
+        handle = conn.locked {
+            val stmtOut = LongArray(1)
+            val rc = SQLiteNative.prepare(conn.handle, sql, stmtOut)
+            if (rc != SQLiteNative.sqliteOk() || stmtOut[0] == 0L) {
+                throw SQLiteException("prepare failed (code $rc): ${conn.errorMessage()} sql=$sql")
+            }
+            StmtHandle(stmtOut[0], conn)
         }
-        stmt = stmtOut[0]
     }
 
     actual fun bindNull(index: Int) {
-        checkOpen()
-        bindCheck(SQLiteNative.bindNull(stmt, index), "bindNull", index)
+        op { stmt -> bindCheck(stmt, SQLiteNative.bindNull(stmt, index), "bindNull", index) }
     }
 
     actual fun bindLong(index: Int, value: Long) {
-        checkOpen()
-        bindCheck(SQLiteNative.bindLong(stmt, index, value), "bindLong", index)
+        op { stmt -> bindCheck(stmt, SQLiteNative.bindLong(stmt, index, value), "bindLong", index) }
     }
 
     actual fun bindInt(index: Int, value: Int) {
-        checkOpen()
-        bindCheck(SQLiteNative.bindLong(stmt, index, value.toLong()), "bindInt", index)
+        op { stmt -> bindCheck(stmt, SQLiteNative.bindLong(stmt, index, value.toLong()), "bindInt", index) }
     }
 
     actual fun bindDouble(index: Int, value: Double) {
-        checkOpen()
-        bindCheck(SQLiteNative.bindDouble(stmt, index, value), "bindDouble", index)
+        op { stmt -> bindCheck(stmt, SQLiteNative.bindDouble(stmt, index, value), "bindDouble", index) }
     }
 
     actual fun bindText(index: Int, value: String) {
-        checkOpen()
-        bindCheck(SQLiteNative.bindText(stmt, index, value), "bindText", index)
+        op { stmt -> bindCheck(stmt, SQLiteNative.bindText(stmt, index, value), "bindText", index) }
     }
 
     actual fun bindBlob(index: Int, value: ByteArray) {
-        checkOpen()
-        bindCheck(SQLiteNative.bindBlob(stmt, index, value), "bindBlob", index)
+        op { stmt -> bindCheck(stmt, SQLiteNative.bindBlob(stmt, index, value), "bindBlob", index) }
     }
 
     actual fun bindVector(index: Int, value: FloatArray) {
         // sqlite-vec accepts a raw float32 BLOB: N * 4 bytes, no header.
-        checkOpen()
         val bytes = ByteArray(value.size * 4).also {
             ByteBuffer.wrap(it).order(ByteOrder.nativeOrder()).asFloatBuffer().put(value)
         }
-        bindCheck(SQLiteNative.bindBlob(stmt, index, bytes), "bindVector", index)
+        bindBlob(index, bytes)
     }
 
     actual fun clearBindings() {
-        checkOpen()
-        SQLiteNative.clearBindings(stmt)
+        op { stmt -> SQLiteNative.clearBindings(stmt) }
     }
 
     actual fun executeUpdate(): Int {
-        checkOpen()
-        val rc = SQLiteNative.step(stmt)
+        val rc = op { stmt -> SQLiteNative.step(stmt) }
         return when (rc) {
             SQLiteNative.sqliteDone(), SQLiteNative.sqliteOk() -> {
-                SQLiteNative.reset(stmt)
+                op { stmt -> SQLiteNative.reset(stmt) }
                 conn.changes
             }
-            else -> throw mapError(conn, stmt, rc, "executeUpdate")
+            else -> throw mapError(conn, rc, "executeUpdate")
         }
     }
 
-    actual fun executeQuery(): SQLiteResultSet {
-        checkOpen()
-        return SQLiteResultSetImpl(StmtHolder(stmt, conn))
-    }
+    actual fun executeQuery(): SQLiteResultSet = op { SQLiteResultSetImpl(handle) }
 
     actual fun reset() {
-        checkOpen()
-        SQLiteNative.reset(stmt)
+        op { stmt -> SQLiteNative.reset(stmt) }
     }
 
     actual override fun close() {
-        if (closed.compareAndSet(false, true) && stmt != 0L) {
-            SQLiteNative.finalize(stmt)
-        }
+        conn.finalizeStmt(handle)
     }
 
-    private fun checkOpen() {
-        if (closed.get()) throw SQLiteException("Statement is closed")
+    /** Выполняет [block] над statement'ом под монитором соединения. */
+    private fun <T> op(block: (Long) -> T): T = synchronized(conn.monitor) {
         conn.checkOpen()
+        if (closed) throw SQLiteException("Statement is closed")
+        block(handle.stmt)
     }
 
-    private fun bindCheck(rc: Int, op: String, index: Int) {
+    private fun bindCheck(stmt: Long, rc: Int, op: String, index: Int) {
         if (rc != SQLiteNative.sqliteOk()) {
             throw SQLiteException("$op@$index failed (code $rc): ${conn.errorMessage()}")
         }

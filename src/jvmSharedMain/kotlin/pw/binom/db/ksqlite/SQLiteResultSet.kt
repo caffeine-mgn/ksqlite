@@ -6,33 +6,40 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 @Suppress("EXPECT_ACTUAL_CLASSIFIERS_ARE_IN_BETA_WARNING")
 actual class SQLiteResultSet internal constructor(
-    internal val holder: StmtHolder,
+    internal val holder: StmtHandle,
 ) : AutoCloseable {
 
     private val closed = AtomicBoolean(false)
 
-    actual val columnCount: Int
-        get() = SQLiteNative.columnCount(holder.stmt)
+    /**
+     * Каждое обращение к нативному statement'у идёт под
+     * [SQLiteConnection.monitor]: пока мы читаем колонку, никто не может
+     * финализировать statement или закрыть соединение.
+     */
+    private fun <T> stmtOp(block: (Long) -> T): T {
+        if (closed.get()) throw SQLiteException("ResultSet is closed")
+        return holder.conn.lockedStmt(holder, block)
+    }
 
-    actual fun next(): Boolean {
-        holder.requireOpen()
-        val rc = SQLiteNative.step(holder.stmt)
-        return when (rc) {
+    actual val columnCount: Int
+        get() = stmtOp { SQLiteNative.columnCount(it) }
+
+    actual fun next(): Boolean = stmtOp { stmt ->
+        val rc = SQLiteNative.step(stmt)
+        when (rc) {
             SQLiteNative.sqliteRow() -> true
             SQLiteNative.sqliteDone() -> false
-            else -> throw mapError(holder.owner, holder.stmt, rc, "next")
+            else -> throw mapError(holder.conn, rc, "next")
         }
     }
 
-    actual fun columnName(index: Int): String {
-        holder.requireOpen()
-        return SQLiteNative.columnName(holder.stmt, index)
+    actual fun columnName(index: Int): String = stmtOp { stmt ->
+        SQLiteNative.columnName(stmt, index)
             ?: throw SQLiteException("columnName($index): null pointer")
     }
 
-    actual fun columnType(index: Int): SqlType {
-        holder.requireOpen()
-        return when (SQLiteNative.columnType(holder.stmt, index)) {
+    actual fun columnType(index: Int): SqlType = stmtOp { stmt ->
+        when (SQLiteNative.columnType(stmt, index)) {
             SQLiteNative.sqliteInteger() -> SqlType.INTEGER
             SQLiteNative.sqliteFloat() -> SqlType.REAL
             SQLiteNative.sqliteText() -> SqlType.TEXT
@@ -42,41 +49,46 @@ actual class SQLiteResultSet internal constructor(
         }
     }
 
-    actual fun isNull(index: Int): Boolean {
-        holder.requireOpen()
-        return SQLiteNative.columnType(holder.stmt, index) == SQLiteNative.sqliteNull()
+    actual fun isNull(index: Int): Boolean = stmtOp { stmt ->
+        SQLiteNative.columnType(stmt, index) == SQLiteNative.sqliteNull()
     }
 
-    actual fun getLong(index: Int): Long? {
-        holder.requireOpen()
-        return if (isNull(index)) null else SQLiteNative.getLong(holder.stmt, index)
+    actual fun getLong(index: Int): Long? = stmtOp { stmt ->
+        if (SQLiteNative.columnType(stmt, index) == SQLiteNative.sqliteNull()) {
+            null
+        } else {
+            SQLiteNative.getLong(stmt, index)
+        }
     }
 
-    actual fun getInt(index: Int): Int? {
-        holder.requireOpen()
-        return if (isNull(index)) null else SQLiteNative.getLong(holder.stmt, index).toInt()
+    actual fun getInt(index: Int): Int? = stmtOp { stmt ->
+        if (SQLiteNative.columnType(stmt, index) == SQLiteNative.sqliteNull()) {
+            null
+        } else {
+            SQLiteNative.getLong(stmt, index).toInt()
+        }
     }
 
-    actual fun getDouble(index: Int): Double? {
-        holder.requireOpen()
-        return if (isNull(index)) null else SQLiteNative.getDouble(holder.stmt, index)
+    actual fun getDouble(index: Int): Double? = stmtOp { stmt ->
+        if (SQLiteNative.columnType(stmt, index) == SQLiteNative.sqliteNull()) {
+            null
+        } else {
+            SQLiteNative.getDouble(stmt, index)
+        }
     }
 
-    actual fun getText(index: Int): String? {
-        holder.requireOpen()
-        return SQLiteNative.getText(holder.stmt, index)
+    actual fun getText(index: Int): String? = stmtOp { stmt ->
+        SQLiteNative.getText(stmt, index)
     }
 
-    actual fun getBlob(index: Int): ByteArray? {
-        holder.requireOpen()
-        return SQLiteNative.getBytes(holder.stmt, index)
+    actual fun getBlob(index: Int): ByteArray? = stmtOp { stmt ->
+        SQLiteNative.getBytes(stmt, index)
     }
 
     actual fun getVector(index: Int): FloatArray? {
-        holder.requireOpen()
         // sqlite-vec stores float32 vectors as a raw BLOB: N * 4 bytes, no
         // header. Same format as bindVector — keep them symmetric.
-        val bytes = SQLiteNative.getBytes(holder.stmt, index) ?: return null
+        val bytes = getBlob(index) ?: return null
         require(bytes.size % 4 == 0) {
             "vector column $index has ${bytes.size} bytes; expected a multiple of 4"
         }
@@ -86,14 +98,10 @@ actual class SQLiteResultSet internal constructor(
         return out
     }
 
-    actual fun getJson(index: Int): Json? {
-        holder.requireOpen()
-        return SQLiteNative.getText(holder.stmt, index)?.let(::Json)
-    }
+    actual fun getJson(index: Int): Json? = getText(index)?.let(::Json)
 
     actual fun getValue(index: Int): SqlValue {
-        holder.requireOpen()
-        return when (columnType(index)) {
+        return when (val t = columnType(index)) {
             SqlType.NULL -> SqlValue.Null
             SqlType.INTEGER -> SqlValue.Integer(getLong(index)!!)
             SqlType.REAL -> SqlValue.Real(getDouble(index)!!)
@@ -104,14 +112,11 @@ actual class SQLiteResultSet internal constructor(
 
     actual override fun close() {
         if (closed.compareAndSet(false, true)) {
-            // For prepared-statement-driven results, do NOT finalize: the
-            // caller may continue to reuse the PreparedStatement. We only
-            // reset the cursor. For ad-hoc statement results, the owner is
-            // the SQLiteStatement which finalizes the stmt in its close().
-            SQLiteNative.reset(holder.stmt)
-            // Помечаем holder finalized — чтобы GC не пытался ничего
-            // сделать с stmt handle (см. KDoc в StmtHolder).
-            holder.markFinalized()
+            // Для resultset'а prepared statement'а НЕ финализируем stmt: его
+            // владелец — сам PreparedStatement, курсор сбрасываем, чтобы
+            // statement можно было переиспользовать. Если statement уже
+            // закрыт (или его закрыли параллельно) — reset становится no-op.
+            holder.conn.resetStmt(holder)
         }
     }
 }

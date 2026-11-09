@@ -39,7 +39,7 @@ val ENV_VERSION = System.getenv("GITHUB_REF_NAME")?.removePrefix("v")
 version = when {
     !PROP_VERSION.isNullOrBlank() && PROP_VERSION != "unspecified" -> PROP_VERSION
     !ENV_VERSION.isNullOrBlank() && ENV_VERSION != "unspecified" -> ENV_VERSION
-    else -> "0.1.6"
+    else -> "0.1.7"
 }
 
 val KOTLIN_VERSION = "2.4.20"

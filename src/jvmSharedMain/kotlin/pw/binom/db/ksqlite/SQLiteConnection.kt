@@ -9,6 +9,17 @@ actual class SQLiteConnection internal constructor(
 
     private val closed = AtomicBoolean(false)
 
+    /**
+     * Монитор, под которым выполняются ВСЕ обращения к нативному handle:
+     * соединение, его statements и result sets. Нужен, потому что sqlite3 —
+     * не потокобезопасный объект: без общей блокировки `sqlite3_finalize`
+     * (закрытие statement'а/соединения) мог выполниться между проверкой
+     * `checkOpen()` и самим нативным вызовом в другом потоке. Тогда вызов
+     * шёл на уже освобождённый `sqlite3_stmt` и JVM падала SIGSEGV'ом
+     * внутри `pthread_mutex_lock` (см. hs_err_pid*.log в репозитории).
+     */
+    internal val monitor = Any()
+
     init {
         require(handle != 0L) { "Tried to wrap a null SQLite handle" }
     }
@@ -17,22 +28,13 @@ actual class SQLiteConnection internal constructor(
         get() = !closed.get()
 
     actual val lastInsertRowId: Long
-        get() {
-            checkOpen()
-            return SQLiteNative.lastInsertRowId(handle)
-        }
+        get() = locked { SQLiteNative.lastInsertRowId(handle) }
 
     actual val changes: Int
-        get() {
-            checkOpen()
-            return SQLiteNative.changes(handle)
-        }
+        get() = locked { SQLiteNative.changes(handle) }
 
     actual val totalChanges: Int
-        get() {
-            checkOpen()
-            return SQLiteNative.totalChanges(handle)
-        }
+        get() = locked { SQLiteNative.totalChanges(handle) }
 
     actual fun prepare(sql: String): SQLitePreparedStatement =
         SQLitePreparedStatementImpl(this, sql)
@@ -40,28 +42,24 @@ actual class SQLiteConnection internal constructor(
     actual fun createStatement(): SQLiteStatement =
         SQLiteStatementImpl(this)
 
-    actual fun exec(sql: String): Int {
-        checkOpen()
+    actual fun exec(sql: String): Int = locked {
         val changesOut = IntArray(1)
         val rc = SQLiteNative.exec(handle, sql, changesOut)
         if (rc != SQLiteNative.sqliteOk()) {
             throw SQLiteException("exec failed (code $rc): ${lastErrorMessage()}")
         }
-        return changesOut[0]
+        changesOut[0]
     }
 
     actual fun beginTransaction() {
-        checkOpen()
         execOrFail("BEGIN")
     }
 
     actual fun commit() {
-        checkOpen()
         execOrFail("COMMIT")
     }
 
     actual fun rollback() {
-        checkOpen()
         try {
             execOrFail("ROLLBACK")
         } catch (_: Throwable) {
@@ -71,25 +69,73 @@ actual class SQLiteConnection internal constructor(
     }
 
     actual fun setBusyTimeout(millis: Int) {
-        checkOpen()
-        SQLiteNative.busyTimeout(handle, millis)
+        locked { SQLiteNative.busyTimeout(handle, millis) }
     }
 
     actual override fun close() {
-        if (closed.compareAndSet(false, true)) {
-            SQLiteNative.close(handle)
+        synchronized(monitor) {
+            if (closed.compareAndSet(false, true)) {
+                SQLiteNative.close(handle)
+            }
         }
     }
 
+    /**
+     * Выполняет [block] под [monitor], предварительно убедившись, что
+     * соединение ещё открыто. Все нативные вызовы обязаны идти через этот
+     * метод (или [locked]), иначе `close()` из другого потока может
+     * освободить handle прямо во время вызова.
+     */
+    internal fun <T> locked(block: () -> T): T = synchronized(monitor) {
+        checkOpen()
+        block()
+    }
+
+    /**
+     * Выполняет нативную операцию над statement'ом под [monitor], проверяя
+     * и соединение, и сам statement.
+     */
+    internal fun <T> lockedStmt(stmt: StmtHandle, block: (Long) -> T): T = synchronized(monitor) {
+        checkOpen()
+        if (stmt.closed) throw SQLiteException("Statement is closed")
+        block(stmt.stmt)
+    }
+
+    /**
+     * Закрывает statement (финализирует handle) под [monitor].
+     *
+     * @return false, если statement уже был закрыт/финализирован.
+     */
+    internal fun finalizeStmt(stmt: StmtHandle): Boolean = synchronized(monitor) {
+        if (stmt.closed) return@synchronized false
+        stmt.closed = true
+        val handle = stmt.stmt
+        if (handle != 0L) {
+            SQLiteNative.finalize(handle)
+        }
+        true
+    }
+
+    /** Сбрасывает курсор statement'а; после finalize — no-op. */
+    internal fun resetStmt(stmt: StmtHandle) {
+        synchronized(monitor) {
+            if (stmt.closed || closed.get()) return
+            SQLiteNative.reset(stmt.stmt)
+        }
+    }
+
+    /** Проверка «открыто ли» без блокировки. Вызывать только под [monitor]. */
     internal fun checkOpen() {
         if (closed.get()) throw SQLiteException("Connection is closed")
     }
 
     private fun execOrFail(sql: String) {
-        val changesOut = IntArray(1)
-        val rc = SQLiteNative.exec(handle, sql, changesOut)
-        if (rc != SQLiteNative.sqliteOk()) {
-            throw SQLiteException("$sql failed (code $rc): ${lastErrorMessage()}")
+        locked {
+            val changesOut = IntArray(1)
+            val rc = SQLiteNative.exec(handle, sql, changesOut)
+            if (rc != SQLiteNative.sqliteOk()) {
+                throw SQLiteException("$sql failed (code $rc): ${lastErrorMessage()}")
+            }
         }
     }
 
