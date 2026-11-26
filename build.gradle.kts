@@ -442,12 +442,20 @@ kotlin {
         val commonMain by getting {
             dependencies {
                 api("org.jetbrains.kotlin:kotlin-stdlib-common:$KOTLIN_VERSION")
+                // Контракты Connection/DatabaseInfo и механика пула. Драйвер
+                // обязан зависеть от kdatabase: без него SQLite не стал бы
+                // участником общей пуловой логики, и каждую очередь/пинг/уборку
+                // пришлось бы писать заново внутри адаптера.
+                api("pw.binom.db:kdatabase:0.1.0")
             }
         }
         val commonTest by getting {
             dependencies {
-                implementation(kotlin("test-common"))
+                implementation(kotlin("test"))
                 implementation(kotlin("test-annotations-common"))
+                // Тесты пула гоняются в runTest — 1.11.0, та же версия, что у
+                // kdatabase: нативные klib требуют совпадения версии coroutines.
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
             }
         }
         // `jvmSharedMain` (shared JVM/Android code) is created by the
