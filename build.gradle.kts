@@ -569,7 +569,9 @@ publishing {
 
 mavenPublishing {
     publishToMavenCentral(automaticRelease = true)
-    signAllPublications()
+    // Подпись отключена локально: GPG-ключа в этой среде нет, а артефакты
+    // нужны в mavenLocal для ksqlite-pool. В CI подпись обязательна.
+    if (findProperty("skipSigning") != "true") signAllPublications()
 
     coordinates(
         groupId = "pw.binom.db",
