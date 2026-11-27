@@ -1,31 +1,47 @@
-name: Release to Maven Central
+# Публикация в Maven Central по тегу N.N.N (или N.N.N-suffix).
+#
+# Схема взята из serial-kmp: ОДНА джоба на macOS-хосте, потому что macOS —
+# единственная платформа, где Kotlin/Native собирает Apple-таргеты
+# (macosArm64/macosX64); оттуда же кросс-собираются linuxX64/linuxArm64/
+# mingwX64 и Android-ABI. Один Sonatype-деплоймент — всё в нём.
+#
+# ## Что изменилось против прежней ubuntu-джобы
+#
+# Раньше публикация шла с ubuntu-latest, и это работало — но при этом
+# jar НЕ НЁС macOS-библиотек: их физически нельзя собрать на Linux. Значит
+# потребитель на маке получал jar без `macos_arm64/libksqlite.dylib` и падал
+# на UnsatisfiedLinkError. Теперь jar собирается на маке и несёт все пять
+# срезов.
+#
+# ## Кросс-заголовки
+#
+# Главная тонкость: macOS-JDK не содержит `include/linux` и `include/win32`.
+# Без чужих `jni_md.h` linux- и mingw-JNI молча получают SKIPPED, и в jar
+# остаётся только macOS-срез. Провижн идёт ОТДЕЛЬНЫМ шагом ДО gradlew, потому
+# что kn-clang вычисляет доступность заголовков на этапе КОНФИГУРАЦИИ, а не
+# выполнения: Gradle-задача, висящая в графе, к этому моменту уже опоздала
+# (проверено на duckdb-kmp).
+#
+# В самом build.gradle.kts ksqlite теперь тоже докачивает заголовки при
+# конфигурации — так что шаг здесь нужен как страховка и как явный лог в CI.
+#
+# ## Что НЕ запускается на маке
+#
+# linuxX64Test / linuxArm64Test / mingwX64Test: бинарник линкуется, но под
+# чужую платформу не исполняется. Для них только компиляция/линковка в
+# составе публикации.
 
-# Tag-triggered: any pushed tag of the form N.N.N (or N.N.N-suffix) starts
-# a Sonatype Central publish. Workflow expects GITHUB_REF_NAME to be the
-# tag itself so build.gradle.kts can pick it up as the project version.
-#
-# Conventions mirror the rest of the caffeine-mgn/* repos (kdns,
-# kn-clang-compiler-plugin): `ubuntu-latest` runner, GPG key imported into
-# the system keyring once at job start, the `signingUseGpg` flag in
-# build.gradle.kts flips the build over to `useGpgCmd()`, and the
-# Sonatype user token plus GPG key id / passphrase are forwarded as
-# `-PmavenCentral*` / `-Psigning.gnupg.*` Gradle properties.
-#
-# Apple targets (iOS / tvOS / watchOS / macOS) are declared in
-# build.gradle.kts but auto-disabled on Linux hosts by the Kotlin
-# Multiplatform plugin, so this CI publishes the JVM + Linux + Android +
-# Mingw slice. Apple klibs are built locally on a Mac when needed; that
-# also matches the kdns / kn-clang-compiler-plugin setup where the CI
-# never claims to cover Apple.
+name: Release to Maven Central
 
 on:
   push:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
@@ -35,60 +51,111 @@ jobs:
         uses: actions/setup-java@v4
         with:
           java-version: 21
-          distribution: liberica
+          distribution: temurin
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # The Android target builds an AAR (com.android.library) and needs a
-      # regular Android SDK for the platform jar and build-tools. The NDK is
-      # NOT required here: kn-clang's Konan downloader fetches its own
-      # bionic toolchain into KONAN_DATA_DIR on first Android build. Gradle
-      # also reads the sdk.dir from local.properties OR the ANDROID_HOME
-      # environment variable exported by setup-android.
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platforms;android-35 build-tools;35.0.0'
-
-      # ksqlite links a SQLite + sqlite-vec amalgamation straight into
-      # every native klib via clangBuildStatic, and on the JVM clangBuildDynamic
-      # produces the .so that NativeLoader extracts at runtime. Linux
-      # toolchain packages are needed for both: gcc/clang for the
-      # plugin and the regular Linux JDK headers for JNI.
-      - name: Install build prerequisites
+      # Кросс-JNI заголовки. Должно быть ДО любого gradlew: kn-clang считает
+      # jni_md.h доступным при конфигурации проекта, иначе linux/mingw JNI
+      # получают SKIPPED и в jar остаётся один macOS-срез.
+      - name: Provision cross JNI headers (linux/win32 jni_md.h)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc g++ clang mingw-w64
+          set -euo pipefail
+          mkdir -p build/jni-include/linux build/jni-include/win32 build/jni-include/darwin
+          curl -fsSL https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/unix/native/include/jni_md.h \
+            -o build/jni-include/linux/jni_md.h
+          curl -fsSL https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/windows/native/include/jni_md.h \
+            -o build/jni-include/win32/jni_md.h
+          curl -fsSL https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/unix/native/include/jni_md.h \
+            -o build/jni-include/darwin/jni_md.h
+          ls -l build/jni-include/*/jni_md.h
 
-      # The GPG private key is stored in GitHub secrets with literal `\n`
-      # escapes (one-line encoding). `printf '%b'` interprets those
-      # escapes, the import is non-interactive (`--batch --pinentry-mode
-      # loopback`) and we let the agent know it's allowed to use the
-      # loopback pinentry.
       - name: Import GPG key
         env:
           GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSWORD }}
         run: |
-          printf '%b' "$GPG_KEY" | gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --import
+          set -euo pipefail
+          command -v gpg >/dev/null 2>&1 || brew install gnupg
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
           echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           gpgconf --reload gpg-agent
+          if [ -n "$GPG_PASSPHRASE" ]; then
+            printf '%b' "$GPG_KEY" | gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$GPG_PASSPHRASE" --import
+          else
+            printf '%b' "$GPG_KEY" | gpg --batch --yes --pinentry-mode loopback --import
+          fi
+          gpg --list-secret-keys --with-colons | grep -q '^sec' && echo "GPG key imported"
 
-      # Fail fast if the Android AAR drops an ABI: each of the four
-      # androidNative* JNI targets must end up as jni/<abi>/libksqlite.so,
-      # otherwise Android apps would silently miss vector/DB support on that
-      # ABI. This mirrors the ABI check klua runs for its own AAR.
+      # Тесты, которые физически исполняются на этом хосте: JVM (через
+      # darwin-срез) и macOS-arm64 native (cinterop через C-ядро).
+      - name: Run host tests (JVM + macOS native)
+        run: ./gradlew jvmTest macosArm64Test --stacktrace
+
+      # Компиляция не-macOS таргетов: их бинарники не исполнить на маке, но
+      # они обязаны собираться — иначе публикация уедет без них.
+      - name: Compile cross targets (linux/mingw/android)
+        run: |
+          ./gradlew \
+            :compileKotlinLinuxX64 :compileKotlinLinuxArm64 \
+            :compileKotlinMingwX64 \
+            :compileKotlinAndroidNativeArm32 :compileKotlinAndroidNativeArm64 \
+            :compileKotlinAndroidNativeX86 :compileKotlinAndroidNativeX64 \
+            --stacktrace
+
+      # jar должен нести нативную библиотеку под каждую ОС: именно её
+      # NativeLoader грузит в рантайме. Проверка доказывает, что кросс-сборки
+      # на маке не превратились в SKIPPED.
+      - name: Verify JVM jar carries every host native library
+        run: |
+          set -euo pipefail
+          ./gradlew jvmJar --stacktrace
+          JAR="$(find build/libs -name 'ksqlite-jvm-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -1)"
+          test -n "$JAR" || { echo "::error::JVM-jar не собран"; ls -l build/libs; exit 1; }
+          echo "jar: $JAR"
+          rm -rf /tmp/jar-payload && mkdir -p /tmp/jar-payload
+          unzip -o -q "$JAR" -d /tmp/jar-payload
+          fail=0
+          for entry in \
+            linux_x64/libksqlite.so \
+            linux_arm64/libksqlite.so \
+            mingw_x64/libksqlite.dll \
+            macos_arm64/libksqlite.dylib
+          do
+            path="/tmp/jar-payload/$entry"
+            if [ ! -f "$path" ]; then
+              echo "::error::в jar нет $entry"
+              fail=1
+              continue
+            fi
+            echo "== $entry ($(stat -f%z "$path") байт)"
+          done
+          file /tmp/jar-payload/linux_x64/libksqlite.so   | grep -q 'ELF 64-bit'   || { echo "::error::linux_x64 не ELF"; fail=1; }
+          file /tmp/jar-payload/linux_arm64/libksqlite.so | grep -q 'ARM aarch64'  || { echo "::error::linux_arm64 не aarch64"; fail=1; }
+          file /tmp/jar-payload/mingw_x64/libksqlite.dll  | grep -qE 'PE32|MS Windows' || { echo "::error::mingw_x64 не PE"; fail=1; }
+          file /tmp/jar-payload/macos_arm64/libksqlite.dylib | grep -q 'Mach-O'    || { echo "::error::macos_arm64 не Mach-O"; fail=1; }
+          exit $fail
+
+      # AAR обязан нести все четыре Android-ABI: иначе приложение на
+      # пропущенной ABI упадёт на dlopen.
       - name: Verify Android AAR carries all four ABIs
         run: |
-          ./gradlew assembleRelease
+          set -euo pipefail
+          ./gradlew assembleRelease --stacktrace
           aar=build/outputs/aar/ksqlite-release.aar
+          test -f "$aar" || { echo "::error::AAR не собран"; exit 1; }
           unzip -l "$aar" | grep -E 'jni/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksqlite\.so'
           count=$(unzip -l "$aar" | grep -c 'jni/.*/libksqlite\.so')
-          test "$count" -eq 4 || { echo "expected 4 native libs in AAR, found $count"; exit 1; }
+          test "$count" -eq 4 || { echo "::error::ожидалось 4 ABI в AAR, найдено $count"; exit 1; }
 
-      - name: Publish to Maven Central
+      - name: Repository hygiene (no build outputs tracked)
+        run: test "$(git ls-files | grep -cE '^(build|\.gradle)/')" = "0"
+
+      - name: Publish all targets to Maven Central
         env:
           GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
           GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}

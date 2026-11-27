@@ -286,7 +286,57 @@ kotlin {
         add(KonanTarget.ANDROID_ARM64)
         add(KonanTarget.ANDROID_X86)
         add(KonanTarget.ANDROID_X64)
-        if (isMacHost) add(currentHost)
+        // macOS: оба среза, потому что jar должен работать и на Intel-маках.
+        // Хост-таргет обязателен всегда; второй срез собирается только на
+        // соответствующей машине Apple (кросс macOS x64 <-> arm64 Clang на
+        // macOS умеет через -arch, kn-clang это делает сам).
+        if (isMacHost) {
+            add(KonanTarget.MACOS_X64)
+            add(KonanTarget.MACOS_ARM64)
+        }
+    }
+
+    /*
+     * Кросс-JNI заголовки — ОБЯЗАТЕЛЬНО на этапе конфигурации.
+     *
+     * 🔴 `clangBuildDynamic` + `onlyIf` ниже вычисляют доступность заголовков
+     * в configuration time: `jdkIncludePlatformCandidates.firstOrNull { ... }`
+     * выполняется при конфигурации проекта. Gradle-задача провижна тут не
+     * поможет — она отработает уже после того, как путь выбран, и
+     * кросс-таргет получит SKIPPED. Проверено на duckdb-kmp: задача качала
+     * заголовки, а `buildJni...MingwX64` оставался SKIPPED.
+     *
+     * Поэтому файлы докачиваются прямо здесь, при конфигурации. Схема — как
+     * в serial-kmp (там curl в отдельном CI-шаге до gradlew), но без
+     * отдельного шага: локально тоже работает.
+     *
+     * Зачем: macOS-JDK не несёт `include/linux` и `include/win32`, поэтому
+     * сборка на маке без этих файлов молча теряет linux- и mingw-библиотеки
+     * из jar, и потребитель на той ОС падает на UnsatisfiedLinkError.
+     */
+    val crossJniHeaderUrls = mapOf(
+        "linux" to "https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/unix/native/include/jni_md.h",
+        "win32" to "https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/windows/native/include/jni_md.h",
+        "darwin" to "https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/unix/native/include/jni_md.h",
+    )
+    val crossJniDir = layout.buildDirectory.dir("jni-include").get().asFile
+    crossJniHeaderUrls.forEach { (platform, url) ->
+        val dir = File(crossJniDir, platform)
+        val file = File(dir, "jni_md.h")
+        if (!file.isFile) {
+            dir.mkdirs()
+            val ok = runCatching {
+                val proc = ProcessBuilder("curl", "-fsSL", "--max-time", "30", url, "-o", file.absolutePath)
+                    .redirectErrorStream(true).start()
+                proc.waitFor() == 0 && file.isFile
+            }.getOrDefault(false)
+            if (ok) {
+                logger.lifecycle("kn-jni: скачан jni_md.h[$platform]")
+            } else {
+                file.delete()
+                logger.warn("kn-jni: нет jni_md.h[$platform] — кросс-таргет семейства '$platform' будет SKIPPED")
+            }
+        }
     }
 
     val jdkHome = System.getenv("JAVA_HOME")
@@ -325,6 +375,9 @@ kotlin {
             jdkHome?.let { "$it/include/$platform" },
             "/usr/lib/jvm/java-21-openjdk/include/$platform",
             "/usr/lib/jvm/default-java/include/$platform",
+            // Кросс-заголовки, докачанные выше: у мака нет linux/win32, у
+            // линукса нет darwin.
+            File(crossJniDir, platform).absolutePath.takeIf { File(it, "jni_md.h").isFile },
         )
         // The platform `jni_md.h` (`win32/` vs `linux/`) is picked for real, but
         // only if the JDK actually ships one for the *cross* platform; a Linux
